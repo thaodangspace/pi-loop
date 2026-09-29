@@ -29,9 +29,9 @@ and reporting in the conversation while the session stays open.
   **maintenance** loops. The maintenance prompt and self-paced behavior land in
   a later change, so for now they report that maintenance mode is not yet
   available and leave any running loop untouched.
-- Interval-looking input that cannot be parsed (for example `/loop 5x check`
-  or `/loop 1h30min check`) fails closed with a usage error. It never becomes
-  task text and never disturbs an existing loop.
+- Interval-looking input that cannot be parsed (for example `/loop 5x check`,
+  `/loop 1h30min check`, or `/loop .5h check`) fails closed with a usage error.
+  It never becomes task text and never disturbs an existing loop.
 
 The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell

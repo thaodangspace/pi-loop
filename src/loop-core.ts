@@ -95,6 +95,15 @@ function isKnownUnit(word: string): boolean {
   return Object.prototype.hasOwnProperty.call(UNIT_MS, word.toLowerCase());
 }
 
+/**
+ * True when text opens like an interval: an optional sign followed by a digit or
+ * a dot-leading number such as `.5h`. Used so fraction-looking input fails
+ * closed instead of leaking into the task.
+ */
+function looksLikeInterval(text: string): boolean {
+  return /^[-+]?(?:\d|\.\d)/.test(text);
+}
+
 type LeadingInterval =
   | { kind: "interval"; intervalMs: number; task: string }
   | { kind: "malformed"; reason: string }
@@ -112,7 +121,7 @@ type LeadingInterval =
 function leadingInterval(args: string): LeadingInterval {
   const tokens = args.split(/\s+/);
   const first = tokens[0] ?? "";
-  if (!/^[-+]?\d/.test(first)) {
+  if (!looksLikeInterval(first)) {
     return { kind: "none" };
   }
   let spec: string | undefined;
@@ -163,7 +172,7 @@ function trailingInterval(args: string): TrailingInterval {
   }
   const spec = /^(\d+)\s*([a-z]+)$/i.exec(intervalText);
   if (!spec) {
-    if (/^[-+]?\d/.test(intervalText)) {
+    if (looksLikeInterval(intervalText)) {
       return {
         kind: "malformed",
         reason: `invalid interval "${intervalText.split(/\s+/)[0]}": use a positive number with a unit such as 30min`,

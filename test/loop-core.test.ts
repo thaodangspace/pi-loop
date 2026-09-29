@@ -103,12 +103,14 @@ test("malformed /loop commands return usage without a task", () => {
 });
 
 test("interval-looking malformed input fails closed instead of becoming a task", () => {
-  for (const bad of ["5x ping", "5 ping", "0s ping", "-5m ping", "1h30min ping"]) {
+  for (const bad of ["5x ping", "5 ping", "0s ping", "-5m ping", "1h30min ping", "1.5h ping", ".5h ping", "-.5h ping"]) {
     assert.equal(parseLoopCommand(bad).type, "usage", `expected ${JSON.stringify(bad)} to fail closed`);
   }
   assert.equal(parseLoopCommand("5").type, "usage");
   assert.equal(parseLoopCommand("every 5x ping").type, "usage");
   assert.equal(parseLoopCommand("check deploy every 5x").type, "usage");
+  assert.equal(parseLoopCommand("check deploy every .5h").type, "usage");
+  assert.equal(parseLoopCommand("check deploy every -.5h").type, "usage");
   assert.equal(parseLoopCommand("check deploy every").type, "usage");
   assert.equal(parseLoopCommand("check deploy every 5").type, "usage");
 });
