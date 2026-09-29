@@ -20,41 +20,81 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
   return { timers, pi, ctx, registry };
 }
 
-test("a bare task uses the configured default and runs at the next boundary", async () => {
+test("a self-paced loop reports its state and can be stopped", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "watch deploy", ctx);
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["watch deploy"]);
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Self-paced loop: watch deploy/);
+  assert.match(ctx.lastNotification()?.message ?? "", /waiting for the next wakeup/);
+
+  await pi.run("loop", "stop", ctx);
+  assert.equal(ctx.lastNotification()?.message, "Loop stopped.");
+  assert.equal(registry.size, 0);
+  assert.equal(timers.pendingCount, 0);
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["watch deploy"], "a stopped self-paced loop has no future wakeups");
+});
+
+test("a bare task starts a self-paced loop with an immediate first run", async () => {
   const { readFile, reads } = configReader('{"defaultInterval":"2min"}');
-  const { timers, pi, ctx } = setup({ readFile });
+  const { timers, pi, ctx, registry } = setup({ readFile });
 
   await pi.run("loop", "check things", ctx);
-  assert.match(ctx.lastNotification()?.message ?? "", /every 2min: check things/);
-  assert.equal(reads(), 1);
+  assert.match(ctx.lastNotification()?.message ?? "", /Self-paced loop: check things/);
+  assert.match(ctx.lastNotification()?.message ?? "", /fallback wakeup in 2min/);
+  assert.equal(reads(), 1, "the fallback delay comes from the configured default");
 
-  assert.deepEqual(pi.sent, [], "the first run must not be immediate");
-  timers.advance(119_999);
+  const [task] = registry.list();
+  assert.ok(task, "starting a self-paced loop registers a task");
+  assert.equal(task.mode, "self-paced");
+  assert.equal(task.nextFireAt, 0, "the first run is due immediately, not on a cadence boundary");
+
   assert.deepEqual(pi.sent, []);
-  timers.advance(1);
+  timers.advance(0);
   assert.deepEqual(pi.sent, ["check things"]);
+  assert.equal(timers.pendingCount, 0, "no timer is armed until the iteration chooses its next wakeup");
 });
 
-test("a missing config file falls back to 1min", async () => {
-  const { timers, pi, ctx } = setup();
+test("a missing config file gives the self-paced loop a 1min fallback", async () => {
+  const { timers, pi, ctx, registry } = setup();
 
   await pi.run("loop", "cheap check", ctx);
-  assert.match(ctx.lastNotification()?.message ?? "", /every 1min/);
-  timers.advance(60_000);
+  assert.match(ctx.lastNotification()?.message ?? "", /fallback wakeup in 1min/);
+  timers.advance(0);
   assert.deepEqual(pi.sent, ["cheap check"]);
+
+  // The iteration never reschedules: one fallback wakeup, then termination.
+  pi.fire("agent_settled", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /fallback wakeup scheduled in 1min/);
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["cheap check", "cheap check"]);
+
+  pi.fire("agent_settled", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /stopped after a repeated missing wakeup/);
+  assert.equal(registry.size, 0, "a repeated miss removes the task");
+  assert.equal(timers.pendingCount, 0);
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["cheap check", "cheap check"], "the terminated loop never runs again");
 });
 
-test("a sub-minute default from config is normalized and reported", async () => {
+test("a sub-minute fallback from config is clamped to the minute minimum", async () => {
   const { readFile } = configReader('{"defaultInterval":"30s"}');
   const { timers, pi, ctx } = setup({ readFile });
 
   await pi.run("loop", "cheap check", ctx);
-  assert.match(ctx.lastNotification()?.message ?? "", /every 1min \(normalized from 30s\): cheap check/);
+  assert.match(
+    ctx.lastNotification()?.message ?? "",
+    /fallback wakeup in 1min \(normalized from 30s\)/,
+  );
 
-  timers.advance(59_999);
-  assert.deepEqual(pi.sent, []);
-  timers.advance(1);
+  timers.advance(0);
   assert.deepEqual(pi.sent, ["cheap check"]);
+  pi.fire("agent_settled", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /scheduled in 1min/);
 });
 
 test("an invalid config reports an error and starts nothing", async () => {

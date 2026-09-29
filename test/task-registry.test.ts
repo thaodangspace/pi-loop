@@ -128,6 +128,37 @@ test("the registry stores a frozen copy of the schedule, not the caller's object
   assert.equal(Object.isFrozen(updated.schedule), true);
 });
 
+test("a self-paced reason is stored on create and updated later", () => {
+  const { registry } = makeRegistry();
+  const created = registry.create({
+    prompt: "check deploy",
+    mode: "self-paced",
+    nextFireAt: 5_000,
+    reason: "wait for CI",
+  });
+  assert.equal(created.reason, "wait for CI");
+
+  const updated = registry.update(created.id, { reason: "CI is still running" });
+  assert.equal(updated.reason, "CI is still running");
+  assert.equal(updated.nextFireAt, 5_000, "reason updates leave other fields alone");
+  assert.equal(
+    registry.update(created.id, { prompt: "renamed" }).reason,
+    "CI is still running",
+    "omitting reason keeps the existing value",
+  );
+
+  const cleared = registry.update(created.id, { reason: null });
+  assert.equal(cleared.reason, undefined, "null clears the reason");
+
+  const withoutReason = registry.create({ prompt: "plain", mode: "fixed" });
+  assert.equal(withoutReason.reason, undefined);
+  assert.equal(
+    registry.update(withoutReason.id, { pending: true }).reason,
+    undefined,
+    "omitting reason leaves it unset",
+  );
+});
+
 test("snapshots are frozen so callers cannot corrupt registry state", () => {
   const { registry } = makeRegistry();
   const task = registry.create({ prompt: "one", mode: "fixed" });
