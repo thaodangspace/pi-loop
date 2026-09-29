@@ -37,6 +37,11 @@ export interface ScheduledTask {
   readonly nextFireAt?: number;
   /** True when a run was missed while busy and is queued for the next idle moment. */
   readonly pending: boolean;
+  /**
+   * Self-paced wakeups only: the reason the iteration gave for its chosen next
+   * delay. Persisted so `/loop status` and diagnostics can explain the schedule.
+   */
+  readonly reason?: string;
 }
 
 /** Fields required to create a task. */
@@ -45,6 +50,7 @@ export interface NewTask {
   mode: TaskMode;
   schedule?: FixedSchedule;
   nextFireAt?: number;
+  reason?: string;
 }
 
 /**
@@ -56,6 +62,8 @@ export interface TaskUpdate {
   pending?: boolean;
   schedule?: FixedSchedule | null;
   nextFireAt?: number | null;
+  /** Wakeup reason; pass `null` to clear it, or omit it to keep the current value. */
+  reason?: string | null;
 }
 
 /** Injectable dependencies so the registry is deterministic under test. */
@@ -179,6 +187,7 @@ export class TaskRegistry {
       createdAt: this.now(),
       ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
       ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
       pending: false,
     });
     this.tasks.set(task.id, task);
@@ -236,6 +245,8 @@ export class TaskRegistry {
         : update.schedule === null
           ? undefined
           : freezeSchedule(update.schedule);
+    const reason =
+      update.reason === undefined ? current.reason : update.reason === null ? undefined : update.reason;
     const next: ScheduledTask = Object.freeze({
       id: current.id,
       prompt: update.prompt ?? current.prompt,
@@ -244,6 +255,7 @@ export class TaskRegistry {
       pending: update.pending ?? current.pending,
       ...(schedule === undefined ? {} : { schedule }),
       ...(nextFireAt === undefined ? {} : { nextFireAt }),
+      ...(reason === undefined ? {} : { reason }),
     });
     this.tasks.set(id, next);
     return next;

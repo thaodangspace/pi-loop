@@ -8,6 +8,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadDefaultInterval, loopConfigPath, type ConfigReader } from "./config.ts";
 import {
+  clampWakeupDelay,
   formatInterval,
   LoopScheduler,
   maintenanceText,
@@ -74,6 +75,12 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       return;
     }
     const pending = state.pending ? " (one run queued for the next idle moment)" : "";
+    if (state.mode === "self-paced") {
+      const awaiting = state.awaitingDecision ? " (waiting for the next wakeup)" : "";
+      const reason = state.reason ? ` (last reason: ${state.reason})` : "";
+      ctx.ui.notify(`Self-paced loop: ${state.task}${pending}${awaiting}${reason}`, "info");
+      return;
+    }
     ctx.ui.notify(`Loop every ${formatInterval(state.intervalMs)}: ${state.task}${pending}`, "info");
   };
 
@@ -86,7 +93,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   };
 
   pi.registerCommand("loop", {
-    description: "Repeat a task at a fixed interval in this session",
+    description: "Repeat a task at an interval, or let each iteration pace itself in this session",
     getArgumentCompletions: (prefix) => {
       const options = ["stop", "status", "every "];
       const matches = options.filter((option) => option.startsWith(prefix));
@@ -118,20 +125,34 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
           break;
       }
 
-      let intervalMs = command.intervalMs;
-      if (intervalMs === undefined) {
+      if (command.intervalMs === undefined) {
+        // Prompt-only `/loop <task>` is self-paced: the iteration chooses its
+        // next wakeup. The optional config interval becomes the bounded fallback
+        // delay used when an iteration does not choose one.
+        let fallbackDelayMs: number;
         try {
           const resolved = await loadDefaultInterval({ configPath, readFile: deps.readFile });
-          intervalMs = resolved.intervalMs;
+          fallbackDelayMs = resolved.intervalMs;
         } catch (error) {
           ctx.ui.notify(`Loop config error: ${errorMessage(error)}`, "error");
           return;
         }
+        scheduler.startSelfPaced(command.task, { fallbackDelayMs });
+        const fallbackMs = clampWakeupDelay(fallbackDelayMs);
+        const fallbackText =
+          fallbackMs === fallbackDelayMs
+            ? formatInterval(fallbackMs)
+            : `${formatInterval(fallbackMs)} (normalized from ${formatInterval(fallbackDelayMs)})`;
+        ctx.ui.notify(
+          `Self-paced loop: ${command.task} (fallback wakeup in ${fallbackText} if no next wakeup is chosen).`,
+          "info",
+        );
+        return;
       }
 
-      scheduler.start(intervalMs, command.task);
+      scheduler.start(command.intervalMs, command.task);
       const effectiveMs = scheduler.status().intervalMs;
-      ctx.ui.notify(`Loop every ${cadenceText(intervalMs, effectiveMs)}: ${command.task}`, "info");
+      ctx.ui.notify(`Loop every ${cadenceText(command.intervalMs, effectiveMs)}: ${command.task}`, "info");
     },
   });
 
@@ -144,9 +165,23 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     latestCtx = ctx;
   });
 
-  // `agent_settled` is Pi's final idle boundary; flush one coalesced run here.
+  // `agent_settled` is Pi's final idle boundary. Settle any self-paced iteration
+  // first (so a run we are about to flush cannot be mistaken for a miss), then
+  // flush one coalesced pending run.
   pi.on("agent_settled", (_event, ctx) => {
     latestCtx = ctx;
+    const settled = scheduler.settleIteration();
+    if (settled.action === "fallback") {
+      ctx.ui.notify(
+        `Self-paced loop did not choose a next wakeup; one fallback wakeup scheduled in ${formatInterval(settled.delayMs)}.`,
+        "warning",
+      );
+    } else if (settled.action === "terminated") {
+      ctx.ui.notify(
+        "Self-paced loop stopped after a repeated missing wakeup. Start it again with /loop if needed.",
+        "warning",
+      );
+    }
     scheduler.flush();
   });
 

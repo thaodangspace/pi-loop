@@ -14,12 +14,19 @@ import {
   nextFireAt,
   type FixedSchedule,
 } from "./schedule.ts";
-import type { ScheduledTask, TaskRegistry } from "./task-registry.ts";
+import type { ScheduledTask, TaskMode, TaskRegistry } from "./task-registry.ts";
 
 /** Minimum accepted parse-time interval. Sub-minute values normalize at scheduling. */
 export const MIN_INTERVAL_MS = 1_000;
 /** Maximum accepted interval; `setTimeout` is capped at a signed 32-bit delay. */
 export const MAX_INTERVAL_MS = 2_147_483_647;
+
+/** Smallest delay a self-paced iteration may request for its next wakeup. */
+export const MIN_WAKEUP_DELAY_MS = MINUTE_MS;
+/** Largest delay a self-paced iteration may request for its next wakeup. */
+export const MAX_WAKEUP_DELAY_MS = HOUR_MS;
+/** Fallback delay used when a self-paced iteration does not choose one. */
+export const DEFAULT_WAKEUP_FALLBACK_MS = MINUTE_MS;
 
 /** Unit suffixes accepted in an interval token, mapped to milliseconds. */
 const UNIT_MS: Readonly<Record<string, number>> = {
@@ -209,7 +216,7 @@ function trailingInterval(args: string): TrailingInterval {
  * Supported forms:
  * - `<interval> <prompt>` (Claude-style, e.g. `5m check deploy`)
  * - `<prompt> every <interval>`
- * - `<prompt>` (literal task, default interval)
+ * - `<prompt>` (literal self-paced task)
  * - `<interval>` and bare `/loop` (maintenance loops; prompt wiring lands with
  *   the maintenance-mode work)
  * - `every <interval> <prompt>` (Pi compatibility alias)
@@ -288,13 +295,13 @@ export function parseLoopCommand(rawArgs: string): LoopCommand {
 export function usageText(reason?: string): string {
   const head = reason ? `Usage error: ${reason}.\n` : "";
   return (
-    `${head}/loop <task>                           repeat <task> at the configured default (1min)\n` +
-    `/loop <n><unit> <task>                    set the interval (units: s, min, h, d)\n` +
-    `/loop <task> every <n><unit>              set the interval after the task\n` +
+    `${head}/loop <task>                           self-paced: run <task> now, then choose the next wakeup\n` +
+    `/loop <n><unit> <task>                    fixed schedule (units: s, min, h, d)\n` +
+    `/loop <task> every <n><unit>              set the fixed interval after the task\n` +
     `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
     `/loop stop                                 cancel the active loop\n` +
     `/loop status                               show the active loop\n` +
-    `Intervals round to a cron cadence: seconds up to the next whole minute, and steps such as 7m or 90m to the nearest supported value.`
+    `Self-paced wakeup delays clamp to 1min-1h. Fixed intervals round to a cron cadence: seconds up to the next whole minute, and steps such as 7m or 90m to the nearest supported value.`
   );
 }
 
@@ -310,12 +317,96 @@ export function maintenanceText(intervalMs?: number): string {
 /** Snapshot of scheduler state for `/loop status`. */
 export interface LoopStatus {
   active: boolean;
-  /** Effective, normalized cadence in milliseconds. */
+  /** Which mode the active task runs in. Absent when no task is active. */
+  mode?: TaskMode;
+  /** Effective, normalized cadence in milliseconds; 0 for self-paced tasks. */
   intervalMs: number;
   task: string;
   pending: boolean;
+  /**
+   * Self-paced only: true while the current iteration has been delivered but has
+   * not yet chosen its next wakeup (or been settled into a fallback).
+   */
+  awaitingDecision?: boolean;
+  /**
+   * Self-paced only: true once a fallback wakeup has been scheduled since the
+   * last explicit reschedule, so a second miss terminates the loop.
+   */
+  fallbackUsed?: boolean;
+  /** Self-paced only: the reason supplied with the most recent wakeup. */
+  reason?: string;
   /** The stored schedule representation, when a fixed loop is active. */
   schedule?: FixedSchedule;
+}
+
+/** Thrown when a wakeup operation is used without an active self-paced loop. */
+export class WakeupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WakeupError";
+  }
+}
+
+/**
+ * Clamp a requested self-paced delay into the supported 1 minute–1 hour range.
+ * Non-finite values are rejected rather than silently clamped, so a malformed
+ * model request surfaces instead of scheduling an arbitrary wakeup.
+ */
+export function clampWakeupDelay(delayMs: number): number {
+  if (typeof delayMs !== "number" || !Number.isFinite(delayMs)) {
+    throw new WakeupError("wakeup delay must be a finite number of milliseconds");
+  }
+  return Math.min(MAX_WAKEUP_DELAY_MS, Math.max(MIN_WAKEUP_DELAY_MS, delayMs));
+}
+
+/** The normalized outcome of a self-paced iteration choosing its next wakeup. */
+export interface WakeupDecision {
+  /** The delay the iteration asked for, before clamping. */
+  requestedMs: number;
+  /** The delay actually scheduled, always within [1 minute, 1 hour]. */
+  delayMs: number;
+  /** True when clamping changed the requested delay. */
+  clamped: boolean;
+  /** Absolute time the wakeup is due. */
+  nextFireAt: number;
+  /** Optional human/model-supplied reason for the chosen delay. */
+  reason?: string;
+}
+
+/** Options accepted when starting a self-paced loop. */
+export interface SelfPacedStartOptions {
+  /**
+   * Delay used for the single bounded fallback wakeup when an iteration neither
+   * reschedules nor stops. Clamped into [1 minute, 1 hour].
+   */
+  fallbackDelayMs?: number;
+}
+
+/**
+ * What happened when a self-paced iteration settled without (or with) a choice.
+ *
+ * - `none`: no iteration was awaiting a decision.
+ * - `fallback`: a single bounded fallback wakeup was scheduled.
+ * - `terminated`: a second consecutive miss stopped the loop.
+ */
+export type IterationSettleResult =
+  | { action: "none" }
+  | { action: "fallback"; delayMs: number; nextFireAt: number }
+  | { action: "terminated" };
+
+/**
+ * The wakeup API an iteration may call while the loop is self-paced.
+ *
+ * This is the scheduler contract, not a prompt-text convention: a delivered
+ * iteration either schedules its next wakeup or stops the loop. Anything that
+ * exposes these operations to the model (for example a Pi tool) should delegate
+ * here rather than re-implement scheduling.
+ */
+export interface WakeupService {
+  /** Schedule the next wakeup, clamping the delay to [1 minute, 1 hour]. */
+  scheduleNextWakeup(delayMs: number, reason?: string): WakeupDecision;
+  /** Cancel the loop and all future wakeups. */
+  stop(): boolean;
 }
 
 /** Injected timer primitives so tests can drive time deterministically. */
@@ -333,27 +424,43 @@ export const systemTimers: SchedulerDeps = {
 };
 
 /**
- * One fixed loop scoped to a single session.
+ * One loop scoped to a single session, in either fixed or self-paced mode.
  *
- * The scheduler holds the active task's ID and its schedule; the task record
- * itself lives in the shared {@link TaskRegistry}.
+ * The scheduler holds the active task's ID and its timing state; the task record
+ * itself lives in the shared {@link TaskRegistry}. Both modes share the same
+ * dispatch path, pending-run coalescing, idle gate, and generation guard.
  *
- * Design guarantees:
+ * Fixed mode guarantees:
  * - A requested interval is normalized to a supported cron cadence (minimum
  *   one minute; seconds and awkward steps round to the nearest cadence).
  * - Fire times are absolute schedule boundaries, so a late tick, a long busy
  *   period, or a clock jump never shifts later boundaries.
- * - At most one pending run exists; missed boundaries coalesce into it and are
+ *
+ * Self-paced mode guarantees:
+ * - An iteration chooses its next wakeup with {@link scheduleNextWakeup}, whose
+ *   delay is clamped into [1 minute, 1 hour].
+ * - An iteration may stop the loop instead (`stop`).
+ * - An iteration that does neither gets one bounded fallback wakeup; if that
+ *   fallback iteration also misses, the loop terminates rather than spinning.
+ *
+ * Shared guarantees:
+ * - At most one pending run exists; missed occurrences coalesce into it and are
  *   never replayed as a backlog.
  * - A generation counter makes callbacks from a replaced/stopped loop no-ops.
  * - `stop`/`dispose` are idempotent and leave no live timer.
  */
-export class LoopScheduler {
+export class LoopScheduler implements WakeupService {
   private timer: unknown = null;
   private generation = 0;
   private disposed = false;
   private schedule: FixedSchedule | undefined;
   private taskId: string | undefined;
+  private mode: TaskMode | undefined;
+  private awaitingDecision = false;
+  private fallbackUsed = false;
+  private fallbackDelayMs = DEFAULT_WAKEUP_FALLBACK_MS;
+  /** Monotonic id for the latest self-paced delivery, to ignore stale failures. */
+  private runToken = 0;
 
   constructor(
     private readonly deps: SchedulerDeps,
@@ -380,7 +487,103 @@ export class LoopScheduler {
     });
     this.taskId = created.id;
     this.schedule = schedule;
+    this.mode = "fixed";
     this.arm(this.generation, created);
+  }
+
+  /**
+   * Start a self-paced loop. The prompt is due immediately; each delivered
+   * iteration is expected to call {@link scheduleNextWakeup} or `stop` before it
+   * settles. A missing choice triggers the bounded fallback described on the
+   * class. The task is created in the shared registry with mode `self-paced`.
+   */
+  startSelfPaced(prompt: string, options: SelfPacedStartOptions = {}): ScheduledTask {
+    if (this.disposed) {
+      throw new Error("scheduler has been disposed");
+    }
+    if (!prompt.trim()) {
+      throw new Error("task must not be empty");
+    }
+    const fallbackDelayMs = clampWakeupDelay(options.fallbackDelayMs ?? DEFAULT_WAKEUP_FALLBACK_MS);
+    this.stop();
+    const created = this.registry.create({
+      prompt,
+      mode: "self-paced",
+      nextFireAt: this.deps.now(),
+    });
+    this.taskId = created.id;
+    this.mode = "self-paced";
+    this.fallbackDelayMs = fallbackDelayMs;
+    this.awaitingDecision = false;
+    this.fallbackUsed = false;
+    this.armSelfPaced(this.generation, created);
+    return created;
+  }
+
+  /**
+   * Schedule the next wakeup of the active self-paced loop.
+   *
+   * The requested delay is clamped into [1 minute, 1 hour]. An explicit choice
+   * clears the fallback allowance, so the loop cannot be terminated for a miss
+   * that a later iteration fixed. Throws {@link WakeupError} when no self-paced
+   * loop is active or the scheduler is disposed.
+   */
+  scheduleNextWakeup(delayMs: number, reason?: string): WakeupDecision {
+    if (this.disposed) {
+      throw new WakeupError("scheduler has been disposed");
+    }
+    const task = this.currentTask();
+    if (!task || task.mode !== "self-paced") {
+      throw new WakeupError("no self-paced loop is running");
+    }
+    const delay = clampWakeupDelay(delayMs);
+    const nextFireAtValue = this.deps.now() + delay;
+    const updated = this.registry.update(task.id, {
+      nextFireAt: nextFireAtValue,
+      pending: false,
+      reason: reason ?? null,
+    });
+    this.awaitingDecision = false;
+    this.fallbackUsed = false;
+    this.clear();
+    this.armSelfPaced(this.generation, updated);
+    return {
+      requestedMs: delayMs,
+      delayMs: delay,
+      clamped: delay !== delayMs,
+      nextFireAt: nextFireAtValue,
+      ...(reason === undefined ? {} : { reason }),
+    };
+  }
+
+  /**
+   * End the current self-paced iteration and apply the bounded fallback policy
+   * when it neither rescheduled nor stopped. Safe to call at every idle boundary
+   * for every mode; returns `{ action: "none" }` when nothing was pending.
+   */
+  settleIteration(): IterationSettleResult {
+    if (this.disposed) {
+      return { action: "none" };
+    }
+    const task = this.currentTask();
+    if (!task || task.mode !== "self-paced" || !this.awaitingDecision) {
+      return { action: "none" };
+    }
+    this.awaitingDecision = false;
+    // A second consecutive miss means the fallback iteration also failed to
+    // choose. Terminate instead of granting another fallback, so a broken loop
+    // can never spin forever.
+    if (this.fallbackUsed) {
+      this.stop();
+      return { action: "terminated" };
+    }
+    this.fallbackUsed = true;
+    const delay = clampWakeupDelay(this.fallbackDelayMs);
+    const fallbackAt = this.deps.now() + delay;
+    const updated = this.registry.update(task.id, { nextFireAt: fallbackAt, pending: false, reason: null });
+    this.clear();
+    this.armSelfPaced(this.generation, updated);
+    return { action: "fallback", delayMs: delay, nextFireAt: fallbackAt };
   }
 
   /** Cancel the active loop. Returns whether a loop was running. Idempotent. */
@@ -393,6 +596,9 @@ export class LoopScheduler {
     }
     this.taskId = undefined;
     this.schedule = undefined;
+    this.mode = undefined;
+    this.awaitingDecision = false;
+    this.fallbackUsed = false;
     return active;
   }
 
@@ -414,6 +620,9 @@ export class LoopScheduler {
     if (!task || !task.pending || !this.isIdle()) {
       return false;
     }
+    if (task.mode === "self-paced") {
+      return this.beginSelfPacedRun(this.generation, task);
+    }
     const updated = this.registry.update(task.id, { pending: false });
     this.safeDispatch(updated, this.generation);
     return true;
@@ -421,11 +630,15 @@ export class LoopScheduler {
 
   status(): LoopStatus {
     const task = this.currentTask();
+    const selfPaced = task?.mode === "self-paced";
     return {
       active: task !== undefined,
       intervalMs: this.schedule?.intervalMs ?? 0,
       task: task?.prompt ?? "",
       pending: task?.pending ?? false,
+      ...(task === undefined ? {} : { mode: task.mode }),
+      ...(selfPaced ? { awaitingDecision: this.awaitingDecision, fallbackUsed: this.fallbackUsed } : {}),
+      ...(task?.reason === undefined ? {} : { reason: task.reason }),
       ...(this.schedule === undefined ? {} : { schedule: this.schedule }),
     };
   }
@@ -459,12 +672,36 @@ export class LoopScheduler {
     }, due - now);
   }
 
+  /** Arm a one-shot timer for the self-paced task's stored `nextFireAt`. */
+  private armSelfPaced(generation: number, task: ScheduledTask): void {
+    if (generation !== this.generation) {
+      return;
+    }
+    const current = this.registry.get(task.id);
+    if (!current || current.mode !== "self-paced") {
+      return;
+    }
+    const now = this.deps.now();
+    const due = current.nextFireAt ?? now;
+    this.timer = this.deps.setTimer(() => {
+      this.timer = null;
+      this.onTick(generation);
+    }, Math.max(0, due - now));
+  }
+
   private onTick(generation: number): void {
     if (generation !== this.generation) {
       return;
     }
     const task = this.currentTask();
-    if (!task || !task.schedule) {
+    if (!task) {
+      return;
+    }
+    if (task.mode === "self-paced") {
+      this.onSelfPacedTick(generation, task);
+      return;
+    }
+    if (!task.schedule) {
       return;
     }
     if (this.isIdle()) {
@@ -488,27 +725,72 @@ export class LoopScheduler {
     this.arm(generation, advanced);
   }
 
-  private safeDispatch(task: ScheduledTask, generation: number): void {
+  /**
+   * A self-paced wakeup came due. Deliver it now when idle, otherwise mark it
+   * pending so the next idle signal flushes it. No timer is re-armed: the next
+   * wakeup is chosen by the iteration that is about to run.
+   */
+  private onSelfPacedTick(generation: number, task: ScheduledTask): void {
+    if (this.isIdle()) {
+      this.beginSelfPacedRun(generation, task);
+    } else {
+      this.registry.update(task.id, { pending: true });
+    }
+  }
+
+  /**
+   * Dispatch one self-paced run and mark the iteration as awaiting a choice.
+   * Returns false (and leaves the run pending for retry) when delivery throws.
+   *
+   * The awaiting flag is set *before* dispatch so a dispatch that synchronously
+   * reschedules (which clears the flag and arms the next timer) is not
+   * overwritten afterwards.
+   */
+  private beginSelfPacedRun(generation: number, task: ScheduledTask): boolean {
+    const updated = this.registry.update(task.id, { pending: false });
+    this.runToken += 1;
+    this.awaitingDecision = true;
+    const delivered = this.safeDispatch(updated, generation, this.runToken);
+    // A synchronous dispatch error clears the flag in onDispatchError; a
+    // replacement/stop during dispatch owns the flag already, so leave it.
+    if (delivered && generation === this.generation && this.currentTask()?.id === task.id) {
+      return true;
+    }
+    return false;
+  }
+
+  /** Dispatch a task snapshot. Returns false when delivery throws synchronously. */
+  private safeDispatch(task: ScheduledTask, generation: number, token?: number): boolean {
     try {
       const result = this.dispatch(task);
       if (result && typeof (result as Promise<void>).then === "function") {
         void (result as Promise<void>).catch((error) => {
-          this.onDispatchError(error, generation);
+          this.onDispatchError(error, generation, token);
         });
       }
+      return true;
     } catch (error) {
-      this.onDispatchError(error, generation);
+      this.onDispatchError(error, generation, token);
+      return false;
     }
   }
 
-  private onDispatchError(error: unknown, generation: number): void {
+  private onDispatchError(error: unknown, generation: number, token?: number): void {
     // Retain at most one pending run and retry only at the next tick or idle
     // signal, so a failing dispatch can never spin. A rejection from a task
     // that has since been stopped or replaced must not requeue its successor,
     // so requeue only when the failing dispatch's generation is still current.
     if (generation === this.generation) {
       const task = this.currentTask();
-      if (task && !task.pending) {
+      if (task?.mode === "self-paced") {
+        // Only the iteration that is still awaiting a choice may be recovered,
+        // so a late rejection cannot requeue a run whose iteration already
+        // rescheduled or one from a previous run.
+        if (token !== undefined && token === this.runToken && this.awaitingDecision && !task.pending) {
+          this.registry.update(task.id, { pending: true });
+          this.awaitingDecision = false;
+        }
+      } else if (task && !task.pending) {
         this.registry.update(task.id, { pending: true });
       }
     }

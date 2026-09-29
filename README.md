@@ -1,8 +1,9 @@
 # pi-loop
 
 A [Pi](https://github.com/earendil-works/pi) extension that repeats a task in the
-current session at a fixed interval. Ask once and Pi keeps performing the task
-and reporting in the conversation while the session stays open.
+current session, either at a fixed interval or with each iteration pacing its own
+next wakeup. Ask once and Pi keeps performing the task and reporting in the
+conversation while the session stays open.
 
 ```
 /loop check all tmux sessions and handle results
@@ -14,9 +15,11 @@ and reporting in the conversation while the session stays open.
 
 ## What it does
 
-- `/loop <task>` repeats `<task>` at the configured default interval (1min).
+- `/loop <task>` starts a **self-paced** loop: the task runs now, and each
+  iteration chooses when it should run again (with `/loop`'s wakeup service) or
+  stops the loop. Delays are clamped to 1 minute–1 hour.
 - `/loop <n><unit> <task>` uses an explicit interval (Claude-style), e.g.
-  `/loop 5m check deploy`.
+  `/loop 5m check deploy`. This is a fixed schedule.
 - `/loop <task> every <n><unit>` uses an explicit interval written after the
   task, e.g. `/loop check deploy every 5m`.
 - `/loop every <n><unit> <task>` is a Pi-compatible alias for the above.
@@ -30,15 +33,39 @@ and reporting in the conversation while the session stays open.
   `90m` → `2h`). Claude-style boundaries are honored, so a `5min` loop started
   at 12:03 first runs at 12:05.
 - `/loop stop` cancels the loop and any queued run.
-- `/loop status` reports the active task, the effective interval, and whether a
-  run is queued.
+- `/loop status` reports the active task, whether it is self-paced or fixed, the
+  effective interval, and whether a run is queued or a wakeup is pending.
 - Bare `/loop` and interval-only `/loop <n><unit>` are recognized as
-  **maintenance** loops. The maintenance prompt and self-paced behavior land in
-  a later change, so for now they report that maintenance mode is not yet
-  available and leave any running loop untouched.
+  **maintenance** loops. The maintenance prompt lands in a later change, so for
+  now they report that maintenance mode is not yet available and leave any
+  running loop untouched.
 - Interval-looking input that cannot be parsed (for example `/loop 5x check`,
   `/loop 1h30min check`, or `/loop .5h check`) fails closed with a usage error.
   It never becomes task text and never disturbs an existing loop.
+
+### Self-paced loops
+
+A prompt-only `/loop <task>` does not run on a cadence. Instead, the first
+iteration runs as soon as Pi is idle, and that iteration decides what happens
+next:
+
+- **Choose the next wakeup.** The iteration can request a delay (and an optional
+  reason) through the scheduler's wakeup service. The delay is clamped into
+  **1 minute–1 hour** and stored on the task as an absolute `nextFireAt`, with
+  the reason kept for `/loop status`.
+- **Stop explicitly.** The iteration can end the loop, which removes the task
+  and cancels any timer.
+- **Fall back safely.** If the iteration settles without doing either, the
+  scheduler grants **one bounded fallback wakeup** using the configured fallback
+  delay (clamped to 1 minute–1 hour). If that fallback iteration also fails to
+  choose, the loop terminates instead of spinning forever.
+
+Self-paced wakeups respect the same idle/due rules as fixed loops: a wakeup that
+comes due while Pi is busy is queued and delivered once when idle, and repeated
+misses coalesce into a single run rather than replaying a backlog.
+
+The wakeup service is scheduler state, not a prompt-text convention. The
+model-facing operations that call it are tracked separately.
 
 The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
@@ -74,18 +101,23 @@ declares the entry point:
 { "pi": { "extensions": ["./src/index.ts"] } }
 ```
 
-## Configure the default interval
+## Configure the self-paced fallback delay
 
-Bare `/loop <task>` (no `every`) reads the optional user-level config file
+Bare `/loop <task>` (no interval) reads the optional user-level config file
 `~/.pi/agent/loop.json`:
 
 ```json
 { "defaultInterval": "5min" }
 ```
 
+For self-paced loops the value is the **fallback wakeup delay**: how long the
+scheduler waits before retrying once when an iteration does not choose its next
+wakeup. Explicit interval loops ignore the file.
+
 - Missing file → `1min`.
-- The configured value is normalized like any other interval, so a default of
-  `45s` schedules at `1min` and is reported as normalized.
+- The configured value is clamped into the supported 1 minute–1 hour wakeup
+  range, so a default of `45s` yields a `1min` fallback and is reported as
+  normalized.
 - The file is re-read on every bare-task command; changes affect newly created
   loops, not an already running timer.
 - A malformed, wrongly shaped, or unreadable file is reported as an error and
@@ -109,20 +141,26 @@ Bare `/loop <task>` (no `every`) reads the optional user-level config file
   loop started at 12:03 first runs at 12:05.
 - **One loop per session.** Creating a new loop replaces the old one and cancels
   its timer. Behind the command, the active loop is stored as a single `fixed`
-  task in a per-session task registry with a stable ID, a normalized schedule,
-  and a computed `nextFireAt`. Later changes build on this for multiple
-  concurrent, self-paced, and persisted tasks.
-- **Missed runs coalesce; no backlog.** If Pi is busy when a boundary passes,
-  missed boundaries collapse into a single pending run delivered once Pi is
-  idle again. Occurrences are never replayed one-per-missed-interval.
+  or `self-paced` task in a per-session task registry with a stable ID, its
+  timing state, and a computed `nextFireAt`. Later changes build on this for
+  multiple concurrent, self-paced, and persisted tasks.
+- **Self-paced wakeups are relative and clamped.** A self-paced iteration's
+  requested delay is measured from when it asks, clamped into 1 minute–1 hour,
+  and stored with an optional reason. A missing choice gets one bounded fallback
+  wakeup; a second consecutive miss terminates the loop.
+- **Missed runs coalesce; no backlog.** If Pi is busy when a boundary or wakeup
+  is due, the run becomes pending and is delivered once Pi is idle again.
+  Occurrences are never replayed one-per-missed-interval.
 - **In-memory only.** Loops do not survive restart, reload, or session
   replacement, and they do not run while Pi is closed.
 - **Stopping does not abort work already running.** It prevents future loop
   messages only.
-- **Minimum cadence is 1 minute.** Intervals must be positive whole numbers with
-  a unit; zero, negatives, fractions, unknown units, and values whose normalized
-  cadence overflows the maximum timer delay (about 24 days) are rejected without
-  changing an existing loop.
+- **Minimum cadence is 1 minute.** Fixed intervals must be positive whole
+  numbers with a unit; zero, negatives, fractions, unknown units, and values
+  whose normalized cadence overflows the maximum timer delay (about 24 days) are
+  rejected without changing an existing loop. Self-paced wakeup delays are
+  clamped into the same 1 minute–1 hour minimum/maximum instead of being
+  rejected.
 - **Boundaries are UTC-based for now.** Minute and hour cadences are unaffected
   for whole-hour timezones, but a `1d` loop currently runs on the UTC day grid.
   Local-time cron and timezone-safe calculation are tracked separately.
@@ -149,9 +187,9 @@ The logic is split so it can be tested without Pi:
 
 | Module | Responsibility |
 |---|---|
-| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the boundary-aligned timer/idle scheduler (injected clock and dispatch). |
+| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, injected clock and dispatch). |
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps) and `nextFireAt` boundary calculation. |
-| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, and deterministic disposal (injected clock and ID generator). |
+| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/index.ts` | Pi wiring: command, idle events, and lifecycle cleanup. |
 
@@ -159,7 +197,8 @@ The logic is split so it can be tested without Pi:
 timers overdue), a deterministic registry factory, and a fake Pi API. Scheduler
 and adapter tests never sleep — they drive time explicitly and assert boundary
 alignment, normalization, coalescing, long busy periods, clock jumps,
-replacement, stop, dispatch errors, and cleanup.
+replacement, stop, dispatch errors, cleanup, and the self-paced reschedule,
+clamp, bounded-fallback, termination, and stale-callback paths.
 
 ### Live smoke test
 
@@ -183,6 +222,12 @@ stream shows `extension_ui_request` notifications for the loop and a
 - **`Loop every 1min (normalized from 30s): ...`** — the requested interval was
   rounded to a cron cadence (whole minutes; clean steps). The effective cadence
   is the one in the message.
+- **`Self-paced loop: ... (fallback wakeup in ...)`** — a prompt-only `/loop
+  <task>` is pacing itself. The delay shown is the clamped fallback wakeup used
+  if an iteration does not choose one.
+- **`Self-paced loop stopped after a repeated missing wakeup.`** — two
+  iterations in a row neither rescheduled nor stopped, so the loop was terminated
+  instead of spinning. Start it again with `/loop` if needed.
 - **`Maintenance loops ... are not available yet.`** — bare `/loop` and
   interval-only `/loop <n><unit>` are recognized, but the maintenance prompt is
   a later change. Pass a task (for example `/loop 5min <task>`) to start a loop.
