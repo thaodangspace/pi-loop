@@ -28,6 +28,7 @@ import {
 } from "./maintenance.ts";
 import { collectEntries, PERSISTENCE_CUSTOM_TYPE, planRestore } from "./persistence.ts";
 import { TaskRegistry, type ScheduledTask } from "./task-registry.ts";
+import { registerSchedulerTools } from "./tools.ts";
 
 export interface LoopExtensionDeps {
   /** Override the `loop.json` path (tests or an explicit deploy). */
@@ -120,6 +121,15 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       pi.appendEntry(PERSISTENCE_CUSTOM_TYPE, event);
     },
   );
+
+  // Model-callable tools share this scheduler and registry with `/loop`, so the
+  // command and the tools always see and mutate the same session-scoped state.
+  registerSchedulerTools(pi, {
+    scheduler,
+    registry,
+    now: () => timers.now(),
+    classifyPrompt: (prompt) => dispatcher.classify(prompt),
+  });
 
   /**
    * Rebuild this session's scheduler state from the active branch only.
