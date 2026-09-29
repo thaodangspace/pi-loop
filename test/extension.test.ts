@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createLoopExtension, type LoopExtensionDeps } from "../src/index.ts";
-import { configReader, FakeCtx, FakePi, FakeTimers, missingFile } from "./helpers.ts";
+import { configReader, FakeCtx, FakePi, FakeTimers, missingFile, testRegistry } from "./helpers.ts";
 
 function setup(overrides: Partial<LoopExtensionDeps> = {}) {
   const timers = new FakeTimers();
   const pi = new FakePi();
   const ctx = new FakeCtx();
+  const registry = overrides.registry ?? testRegistry(timers);
   createLoopExtension(pi.asExtensionApi(), {
     configPath: "/tmp/loop.json",
     timers,
@@ -14,8 +15,9 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
       throw missingFile();
     },
     ...overrides,
+    registry,
   });
-  return { timers, pi, ctx };
+  return { timers, pi, ctx, registry };
 }
 
 test("a bare task uses the configured default and runs after one interval", async () => {
@@ -197,14 +199,16 @@ test("a dispatch failure notifies and retries only at a safe point", async () =>
 });
 
 test("session shutdown stops the timer and clears pending work", async () => {
-  const { timers, pi, ctx } = setup();
+  const { timers, pi, ctx, registry } = setup();
 
   await pi.run("loop", "every 1s ping", ctx);
   ctx.idle = false;
   timers.advance(1_000);
+  assert.equal(registry.size, 1);
   pi.fire("session_shutdown");
 
   assert.equal(timers.pendingCount, 0);
+  assert.equal(registry.size, 0, "shutdown drops every task");
   timers.advance(10_000);
   assert.deepEqual(pi.sent, []);
 });
@@ -216,12 +220,48 @@ test("each extension instance keeps its own timer and state", async () => {
   await a.pi.run("loop", "every 1s taskA", a.ctx);
   await b.pi.run("loop", "every 1s taskB", b.ctx);
 
+  assert.equal(a.registry.size, 1);
+  assert.equal(b.registry.size, 1);
+  assert.notEqual(a.registry, b.registry, "each session gets its own registry");
+  assert.equal(a.registry.list()[0]!.prompt, "taskA");
+  assert.equal(b.registry.list()[0]!.prompt, "taskB");
+
   a.timers.advance(1_000);
   assert.deepEqual(a.pi.sent, ["taskA"]);
   assert.deepEqual(b.pi.sent, [], "one session's tick must not dispatch another session's task");
 
   b.timers.advance(1_000);
   assert.deepEqual(b.pi.sent, ["taskB"]);
+
+  // Mutating one session's registry must not touch the other.
+  a.registry.clear();
+  assert.equal(a.registry.size, 0);
+  assert.equal(b.registry.size, 1, "one session's cleanup leaves the other intact");
+});
+
+test("creating the extension allocates no timers or tasks at load time", () => {
+  const { timers, registry } = setup();
+  assert.equal(timers.pendingCount, 0, "no timer is created at factory load");
+  assert.equal(registry.size, 0, "no task is created at factory load");
+});
+
+test("the active loop is represented as one fixed registry task", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "every 5s check deploy", ctx);
+  const [task] = registry.list();
+  assert.ok(task, "starting a loop registers a task");
+  assert.equal(task.mode, "fixed");
+  assert.equal(task.prompt, "check deploy");
+  assert.equal(task.nextFireAt, 5_000);
+
+  timers.advance(5_000);
+  assert.deepEqual(pi.sent, ["check deploy"]);
+  assert.equal(registry.get(task.id)?.id, task.id, "the ID is stable while the loop runs");
+  assert.equal(registry.get(task.id)?.nextFireAt, 10_000);
+
+  await pi.run("loop", "stop", ctx);
+  assert.equal(registry.size, 0, "stopping removes the task");
 });
 
 test("status reports a pending run and clears it after flush", async () => {
