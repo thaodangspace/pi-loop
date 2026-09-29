@@ -1,0 +1,33 @@
+{
+  "name": "pi-loop",
+  "version": "0.1.0",
+  "description": "Pi extension that repeats a task at a fixed interval in the current session",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "loop",
+    "schedule"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-reporter=spec test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

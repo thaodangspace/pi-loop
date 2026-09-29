@@ -1,0 +1,154 @@
+/**
+ * Deterministic fakes shared by the test suites: a manual timer queue and a
+ * minimal Pi extension API/context.
+ */
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ConfigReader } from "../src/config.ts";
+import type { SchedulerDeps } from "../src/loop-core.ts";
+
+interface FakeTimerTask {
+  at: number;
+  fn: () => void;
+}
+
+/** Virtual clock + timer queue implementing the scheduler's timer deps. */
+export class FakeTimers implements SchedulerDeps {
+  now = 0;
+  private nextId = 1;
+  private readonly tasks = new Map<number, FakeTimerTask>();
+
+  setTimer = (fn: () => void, ms: number): number => {
+    const id = this.nextId++;
+    this.tasks.set(id, { at: this.now + ms, fn });
+    return id;
+  };
+
+  clearTimer = (handle: unknown): void => {
+    this.tasks.delete(handle as number);
+  };
+
+  get pendingCount(): number {
+    return this.tasks.size;
+  }
+
+  /** Advance the clock, firing every due timer in timestamp order. */
+  advance(ms: number): void {
+    const target = this.now + ms;
+    let steps = 0;
+    for (;;) {
+      let nextId: number | undefined;
+      let nextAt = Number.POSITIVE_INFINITY;
+      for (const [id, task] of this.tasks) {
+        if (task.at <= target && task.at < nextAt) {
+          nextAt = task.at;
+          nextId = id;
+        }
+      }
+      if (nextId === undefined) {
+        break;
+      }
+      const task = this.tasks.get(nextId)!;
+      this.tasks.delete(nextId);
+      this.now = task.at;
+      task.fn();
+      if (++steps > 10_000) {
+        throw new Error("fake timer runaway");
+      }
+    }
+    this.now = target;
+  }
+}
+
+export interface FakeNotification {
+  message: string;
+  type?: "info" | "warning" | "error";
+}
+
+/** Minimal command context used by the extension adapter. */
+export class FakeCtx {
+  readonly notifications: FakeNotification[] = [];
+  idle = true;
+  readonly ui = {
+    notify: (message: string, type?: "info" | "warning" | "error"): void => {
+      this.notifications.push({ message, type });
+    },
+  };
+
+  isIdle(): boolean {
+    return this.idle;
+  }
+
+  lastNotification(): FakeNotification | undefined {
+    return this.notifications.at(-1);
+  }
+
+  asCommandContext(): ExtensionCommandContext {
+    return this as unknown as ExtensionCommandContext;
+  }
+}
+
+export type FakeHandler = (event: unknown, ctx: FakeCtx) => unknown;
+
+/** Minimal ExtensionAPI that records registrations and outbound messages. */
+export class FakePi {
+  readonly commands = new Map<string, { handler: (args: string, ctx: FakeCtx) => Promise<void> }>();
+  readonly handlers = new Map<string, FakeHandler[]>();
+  readonly sent: string[] = [];
+  sendError: Error | undefined;
+
+  registerCommand(name: string, options: { handler: (args: string, ctx: FakeCtx) => Promise<void> }): void {
+    this.commands.set(name, options);
+  }
+
+  on(event: string, handler: FakeHandler): () => void {
+    const list = this.handlers.get(event) ?? [];
+    list.push(handler);
+    this.handlers.set(event, list);
+    return () => {
+      this.handlers.set(
+        event,
+        (this.handlers.get(event) ?? []).filter((item) => item !== handler),
+      );
+    };
+  }
+
+  sendUserMessage(content: string | unknown): void {
+    if (this.sendError) {
+      throw this.sendError;
+    }
+    this.sent.push(typeof content === "string" ? content : JSON.stringify(content));
+  }
+
+  async run(command: string, args: string, ctx: FakeCtx): Promise<void> {
+    const registered = this.commands.get(command);
+    if (!registered) {
+      throw new Error(`command not registered: ${command}`);
+    }
+    await registered.handler(args, ctx);
+  }
+
+  fire(event: string, ctx?: FakeCtx, payload: unknown = { type: event }): void {
+    for (const handler of this.handlers.get(event) ?? []) {
+      handler(payload, ctx as FakeCtx);
+    }
+  }
+
+  asExtensionApi(): ExtensionAPI {
+    return this as unknown as ExtensionAPI;
+  }
+}
+
+export function configReader(contents: string): { readFile: ConfigReader; reads: () => number } {
+  let reads = 0;
+  return {
+    readFile: async () => {
+      reads += 1;
+      return contents;
+    },
+    reads: () => reads,
+  };
+}
+
+export function missingFile(): NodeJS.ErrnoException {
+  return Object.assign(new Error("ENOENT"), { code: "ENOENT" }) as NodeJS.ErrnoException;
+}
