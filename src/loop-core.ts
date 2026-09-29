@@ -18,9 +18,11 @@ import {
 import {
   createSchedule,
   DAY_MS,
+  defaultExpiresAt,
   HOUR_MS,
+  jitterOffsetMs,
   MINUTE_MS,
-  nextFireAt,
+  nextFireAtJittered,
   type FixedSchedule,
 } from "./schedule.ts";
 import type { RestoredTask, ScheduledTask, TaskMode, TaskRegistry, TaskUpdate } from "./task-registry.ts";
@@ -382,7 +384,12 @@ export interface WakeupDecision {
 export interface StartOptions {
   /** Mark a maintenance loop, whose prompt is re-resolved on every run. */
   maintenance?: boolean;
-  /** Optional absolute time after which the task must not run or be restored. */
+  /**
+   * Optional absolute time after which the task must not run or be restored.
+   * Defaults for recurring fixed tasks to `createdAt + DEFAULT_TASK_TTL_MS`
+   * (seven days); an explicit value overrides it and may shorten or lengthen it.
+   * One-shot and self-paced tasks have no default expiry.
+   */
   expiresAt?: number;
 }
 
@@ -428,6 +435,13 @@ export interface SchedulerDeps {
   now(): number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
+  /**
+   * Deterministic phase offset applied to a recurring fixed task's boundaries,
+   * derived from its stable ID and cadence. Defaults to
+   * {@link jitterOffsetMs}; a test double may inject a fixed offset (for example
+   * zero) to assert the underlying un-jittered grid.
+   */
+  jitterOffset?(id: string, intervalMs: number): number;
 }
 
 export const systemTimers: SchedulerDeps = {
@@ -481,6 +495,15 @@ interface TrackedTask {
  *   one minute; seconds and awkward steps round to the nearest cadence).
  * - Fire times are absolute schedule boundaries, so a late tick, a long busy
  *   period, or a clock jump never shifts later boundaries.
+ * - Each recurring task gets a deterministic phase offset derived from its
+ *   stable ID (see {@link jitterOffsetMs}), bounded to a fraction of its cadence
+ *   so load spreads without changing the cadence. One-shot and self-paced tasks
+ *   are never jittered.
+ * - A recurring fixed task expires {@link DEFAULT_TASK_TTL_MS} after creation
+ *   unless the caller supplied an explicit expiry. A boundary exactly at the
+ *   expiry may still run; any later run is dropped, and an expired task is
+ *   removed from the registry, its timer, the due queue, and persistence even
+ *   if Pi stays busy.
  *
  * Self-paced mode guarantees:
  * - An iteration chooses its next wakeup with {@link scheduleNextWakeup}, whose
@@ -553,16 +576,7 @@ export class LoopScheduler implements WakeupService {
     // A command start replaces the command-owned loop; independently scheduled
     // tasks (scheduleFixed) keep running.
     this.stop();
-    const schedule = createSchedule(intervalMs);
-    const created = this.registry.create({
-      prompt: task,
-      mode: "fixed",
-      ...(options.maintenance ? { maintenance: true } : {}),
-      schedule,
-      nextFireAt: nextFireAt(schedule, this.deps.now()),
-      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
-    });
-    const entry = this.track(created);
+    const { task: created, entry, schedule } = this.createFixedTask(intervalMs, task, options);
     this.primaryId = created.id;
     this.primarySchedule = schedule;
     this.persistCreate(created);
@@ -581,19 +595,40 @@ export class LoopScheduler implements WakeupService {
     if (!task.trim()) {
       throw new Error("task must not be empty");
     }
+    const { task: created, entry } = this.createFixedTask(intervalMs, task, options);
+    this.persistCreate(created);
+    this.arm(entry, created);
+    return created;
+  }
+
+  /**
+   * Create and track one recurring fixed task.
+   *
+   * The default lifetime is {@link DEFAULT_TASK_TTL_MS} from creation; an
+   * explicit `expiresAt` overrides it (and may shorten or lengthen it). The
+   * first fire time is computed *after* the registry allocates the stable ID, so
+   * the ID-derived jitter phase is baked into the persisted `nextFireAt` and is
+   * reproduced exactly when the task is restored.
+   */
+  private createFixedTask(
+    intervalMs: number,
+    task: string,
+    options: StartOptions,
+  ): { task: ScheduledTask; entry: TrackedTask; schedule: FixedSchedule } {
     const schedule = createSchedule(intervalMs);
+    const now = this.deps.now();
     const created = this.registry.create({
       prompt: task,
       mode: "fixed",
       ...(options.maintenance ? { maintenance: true } : {}),
       schedule,
-      nextFireAt: nextFireAt(schedule, this.deps.now()),
-      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+      expiresAt: options.expiresAt ?? defaultExpiresAt(now),
     });
-    const entry = this.track(created);
-    this.persistCreate(created);
-    this.arm(entry, created);
-    return created;
+    const fired = this.registry.update(created.id, {
+      nextFireAt: this.nextBoundary(schedule, created.id, now),
+    });
+    const entry = this.track(fired);
+    return { task: fired, entry, schedule };
   }
 
   /**
@@ -646,6 +681,12 @@ export class LoopScheduler implements WakeupService {
     try {
       let task: ScheduledTask;
       try {
+        // A fixed task persisted before the default lifetime existed (no
+        // `expiresAt`) still gets the seven-day bound, anchored on its original
+        // creation time, so a restored task can never outlive an equivalent
+        // freshly-created one.
+        const expiresAt =
+          input.expiresAt ?? (input.mode === "fixed" ? defaultExpiresAt(input.createdAt) : undefined);
         const restored: RestoredTask = {
           id: input.id,
           prompt: input.prompt,
@@ -654,7 +695,7 @@ export class LoopScheduler implements WakeupService {
           createdAt: input.createdAt,
           ...(input.schedule === undefined ? {} : { schedule: input.schedule }),
           ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
-          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+          ...(expiresAt === undefined ? {} : { expiresAt }),
         };
         task = this.registry.restore(restored);
       } catch (error) {
@@ -670,6 +711,11 @@ export class LoopScheduler implements WakeupService {
         this.armAtTime(entry, task.nextFireAt ?? this.deps.now());
       } else {
         this.arm(entry, task);
+      }
+      // Arming may have found the task already expired and removed it; report
+      // that as "not restored" so callers do not treat it as live.
+      if (!this.entries.has(task.id)) {
+        return undefined;
       }
       return task;
     } finally {
@@ -896,6 +942,11 @@ export class LoopScheduler implements WakeupService {
       if (task.mode === "self-paced") {
         this.beginSelfPacedRun(entry, task);
       } else {
+        // A queued run whose task expired during a long busy period is dropped
+        // (and removed from persistence) instead of being delivered late.
+        if (this.expireIfPast(entry, task)) {
+          continue;
+        }
         this.deliverFixed(entry, task);
       }
       dispatched = true;
@@ -981,6 +1032,32 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
+   * The next jittered boundary for a task. The phase offset is derived from the
+   * task's stable ID, so it is identical on creation and on every restore.
+   */
+  private nextBoundary(schedule: FixedSchedule, id: string, after: number): number {
+    return nextFireAtJittered(schedule, id, after, this.deps.jitterOffset ?? jitterOffsetMs);
+  }
+
+  /**
+   * Remove a fixed or one-shot task whose expiry has already passed, without
+   * dispatching. A boundary exactly at the expiry is allowed to run; only a run
+   * strictly *after* expiry is dropped. Returns whether the task was removed.
+   *
+   * This is the safety net for a delayed tick or a long busy period: the run-time
+   * guard removes the task from the registry, its timer, the due queue, and (at
+   * runtime) persistence even when no further boundary is ever reached.
+   */
+  private expireIfPast(entry: TrackedTask, task: ScheduledTask): boolean {
+    const expiresAt = this.registry.get(entry.id)?.expiresAt ?? task.expiresAt;
+    if (expiresAt === undefined || expiresAt >= this.deps.now()) {
+      return false;
+    }
+    this.stopTask(entry.id, { persist: this.restoreDepth === 0 });
+    return true;
+  }
+
+  /**
    * Arm a timer for the task's next boundary. The boundary is taken from the
    * stored schedule, so arming late (after a slow tick or a clock jump) skips
    * missed boundaries instead of shifting the schedule. A task whose next
@@ -997,7 +1074,9 @@ export class LoopScheduler implements WakeupService {
     this.clearTimer(entry);
     const now = this.deps.now();
     const due =
-      task.nextFireAt !== undefined && task.nextFireAt > now ? task.nextFireAt : nextFireAt(schedule, now);
+      task.nextFireAt !== undefined && task.nextFireAt > now
+        ? task.nextFireAt
+        : this.nextBoundary(schedule, entry.id, now);
     const expiresAt = this.registry.get(entry.id)?.expiresAt ?? task.expiresAt;
     if (expiresAt !== undefined && (expiresAt <= now || due > expiresAt)) {
       this.stopTask(entry.id, { persist: this.restoreDepth === 0 });
@@ -1052,6 +1131,11 @@ export class LoopScheduler implements WakeupService {
       this.onSelfPacedTick(entry, task);
       return;
     }
+    // A delayed tick (a sleep, a clock jump) may arrive after expiry. Remove the
+    // task instead of delivering an expired run, even while Pi is busy.
+    if (this.expireIfPast(entry, task)) {
+      return;
+    }
     if (task.mode === "one-shot") {
       // A one-shot either fires once now or is queued for the next idle moment;
       // it is never re-armed.
@@ -1079,10 +1163,10 @@ export class LoopScheduler implements WakeupService {
     if (!current || !current.schedule) {
       return;
     }
-    // Boundaries are absolute, so derive the next one from the schedule rather
-    // than from the tick time. Missed boundaries collapse into the one queue
-    // entry already recorded.
-    const due = nextFireAt(current.schedule, this.deps.now());
+    // Boundaries are absolute and ID-jittered, so derive the next one from the
+    // schedule rather than from the tick time. Missed boundaries collapse into
+    // the one queue entry already recorded.
+    const due = this.nextBoundary(current.schedule, current.id, this.deps.now());
     const advanced = this.registry.update(current.id, { nextFireAt: due });
     this.arm(entry, advanced);
   }
@@ -1128,6 +1212,10 @@ export class LoopScheduler implements WakeupService {
    */
   private deliverFixed(entry: TrackedTask, task: ScheduledTask): boolean {
     this.due.remove(entry.id);
+    // Last line of defense: never dispatch a task whose expiry has passed.
+    if (this.expireIfPast(entry, task)) {
+      return false;
+    }
     if (this.entries.get(entry.id) !== entry || !this.registry.has(entry.id)) {
       return false;
     }

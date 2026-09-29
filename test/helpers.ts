@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import type { ConfigReader } from "../src/config.ts";
 import type { SlashCommandLike } from "../src/dispatch.ts";
 import type { SchedulerDeps } from "../src/loop-core.ts";
+import type { JitterOffset } from "../src/schedule.ts";
 import { TaskRegistry } from "../src/task-registry.ts";
 
 interface FakeTimerTask {
@@ -18,6 +19,13 @@ export class FakeTimers implements SchedulerDeps {
   clock = 0;
   private nextId = 1;
   private readonly tasks = new Map<number, FakeTimerTask>();
+
+  /**
+   * Task-ID jitter is disabled by default so the boundary/grid suites assert the
+   * underlying `anchor + k × cadence` schedule. Jitter-specific tests override
+   * this with the real {@link jitterOffsetMs} (or any deterministic function).
+   */
+  jitterOffset: JitterOffset = () => 0;
 
   now = (): number => this.clock;
 

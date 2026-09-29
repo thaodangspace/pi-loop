@@ -13,6 +13,11 @@
  * default). Because every supported cadence divides a day evenly, the grid
  * never drifts and boundaries are identical regardless of when a task starts.
  * Local-time cron and timezone-aware anchors are a later change.
+ *
+ * The module also owns two recurring-fixed-task policies: a deterministic,
+ * ID-derived phase offset ({@link jitterOffsetMs}) that spreads same-cadence
+ * tasks without changing the cadence, and the default seven-day lifetime
+ * ({@link DEFAULT_TASK_TTL_MS}).
  */
 
 /** One minute in milliseconds; the finest cadence cron can express. */
@@ -25,6 +30,101 @@ export const DAY_MS = 86_400_000;
 export const MIN_CADENCE_MS = MINUTE_MS;
 /** Largest cadence representable by a `setTimeout` delay (signed 32-bit). */
 export const MAX_CADENCE_MS = 2_147_483_647;
+
+/**
+ * Default lifetime of a recurring fixed task: seven days from creation. The
+ * scheduler stamps a task with `createdAt + this` unless the caller supplies an
+ * explicit expiry, which may shorten (or lengthen) the lifetime.
+ */
+export const DEFAULT_TASK_TTL_MS = 7 * DAY_MS;
+
+/** Absolute default expiry for a recurring fixed task created at `createdAt`. */
+export function defaultExpiresAt(createdAt: number): number {
+  return createdAt + DEFAULT_TASK_TTL_MS;
+}
+
+/**
+ * Largest phase offset a cadence may ever receive. Bounding the *absolute*
+ * spread keeps a long cadence (a day or more) from sliding by a whole fraction
+ * of itself, while the per-cadence fraction below keeps a short cadence (a
+ * 1-minute task especially) from shifting more than a small part of its step.
+ */
+export const MAX_JITTER_MS = HOUR_MS;
+
+/** Fraction of a cadence that the jitter window may occupy. */
+const JITTER_FRACTION = 1 / 4;
+
+/**
+ * Width of the deterministic jitter window for a cadence: a quarter of the
+ * cadence, capped at {@link MAX_JITTER_MS}. The window is always strictly
+ * smaller than the cadence, so a jittered boundary can never reach, let alone
+ * pass, the next un-jittered boundary.
+ */
+export function jitterWindowMs(intervalMs: number): number {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(Math.floor(intervalMs * JITTER_FRACTION), MAX_JITTER_MS));
+}
+
+/**
+ * Stable 32-bit FNV-1a hash of a task ID.
+ *
+ * The algorithm is fixed (offset basis `0x811c9dc5`, prime `0x01000193`) so an
+ * ID always hashes to the same value across processes, sessions, and restores.
+ * It is a spread function, not a security primitive.
+ */
+export function hashTaskId(id: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < id.length; index += 1) {
+    hash ^= id.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+/** A deterministic per-task phase offset, in milliseconds. */
+export type JitterOffset = (id: string, intervalMs: number) => number;
+
+/**
+ * Deterministic phase offset for a recurring fixed task: `hash(id)` modulo the
+ * cadence's jitter window, so the result lies in `[0, window)`. The same ID and
+ * cadence always produce the same offset, and the offset is independent of when
+ * a task starts, which is what makes a restore reproduce the original phase.
+ */
+export function jitterOffsetMs(id: string, intervalMs: number): number {
+  const window = jitterWindowMs(intervalMs);
+  return window === 0 ? 0 : hashTaskId(id) % window;
+}
+
+/**
+ * The first *jittered* boundary strictly after `after`.
+ *
+ * The jittered grid is `anchor + offset + k * intervalMs`, where `offset` is a
+ * pure function of the task ID and cadence. Because the offset is fixed for the
+ * lifetime of the task, every boundary keeps the same phase and no drift
+ * accumulates; a late run, a long busy period, or a clock jump never moves a
+ * later boundary. An injected `offset` is sanitized into `[0, intervalMs)` so it
+ * cannot reorder boundaries.
+ */
+export function nextFireAtJittered(
+  schedule: FixedSchedule,
+  id: string,
+  after: number,
+  offset: JitterOffset = jitterOffsetMs,
+): number {
+  if (!Number.isFinite(after)) {
+    throw new ScheduleError("reference time must be a finite epoch time");
+  }
+  const { intervalMs, anchor } = schedule;
+  const requested = offset(id, intervalMs);
+  const applied = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.floor(requested), 0), Math.max(0, intervalMs - 1))
+    : 0;
+  const shifted = anchor + applied;
+  const steps = Math.floor((after - shifted) / intervalMs) + 1;
+  return shifted + steps * intervalMs;
+}
 
 /** Thrown for a schedule that cannot be constructed. */
 export class ScheduleError extends Error {
