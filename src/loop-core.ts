@@ -3,9 +3,11 @@
  * scheduler. Nothing in this file imports the Pi runtime, so it can be tested
  * with deterministic fake timers.
  *
- * The scheduler keeps no task state of its own; the authoritative task record
- * lives in a {@link TaskRegistry}, one per session.
+ * The registry is the authoritative store of task records, one per session. The
+ * scheduler owns the timing state and the per-task due queue that decide what
+ * runs and in which order.
  */
+import { DueQueue } from "./due-queue.ts";
 import {
   createSchedule,
   DAY_MS,
@@ -426,11 +428,44 @@ export const systemTimers: SchedulerDeps = {
 };
 
 /**
- * One loop scoped to a single session, in either fixed or self-paced mode.
+ * Per-task scheduling state that the scheduler owns for every task it tracks.
  *
- * The scheduler holds the active task's ID and its timing state; the task record
- * itself lives in the shared {@link TaskRegistry}. Both modes share the same
- * dispatch path, pending-run coalescing, idle gate, and generation guard.
+ * The registry remains the authoritative store of the task's public record; this
+ * entry holds the state that is not persisted: the callback token, the armed
+ * timer, and the self-paced decision flags.
+ */
+interface TrackedTask {
+  /** Stable registry ID; also the key in the due queue. */
+  readonly id: string;
+  /** Registration order, used to break simultaneous-deadline ties. */
+  readonly seq: number;
+  /**
+   * Token captured by every timer callback for this entry. A callback whose
+   * entry has been removed or superseded finds a different token (or no entry)
+   * and is ignored, so a stale callback can never dispatch.
+   */
+  token: number;
+  /** The single armed timer for this task, or null while none is armed. */
+  timer: unknown;
+  /** Self-paced only: a delivered run still owes a next-wakeup decision. */
+  awaitingDecision: boolean;
+  /** Self-paced only: the one bounded fallback has already been granted. */
+  fallbackUsed: boolean;
+  /** Self-paced only: the configured fallback delay for this task. */
+  fallbackDelayMs: number;
+  /** Monotonic id for the latest self-paced delivery, to ignore stale failures. */
+  runToken: number;
+}
+
+/**
+ * One scheduler scoped to a single session, tracking one or more scheduled
+ * tasks in either fixed or self-paced mode.
+ *
+ * The scheduler owns *when each task is due*: a scheduler-local {@link DueQueue}
+ * keyed by task ID decides what is flushed and in which order. The registry is
+ * still the authoritative store of task records, and its `pending` field is kept
+ * in sync as a readable mirror for status and diagnostics, but dispatch is driven
+ * by the queue, never by scanning that boolean.
  *
  * Fixed mode guarantees:
  * - A requested interval is normalized to a supported cron cadence (minimum
@@ -443,13 +478,22 @@ export const systemTimers: SchedulerDeps = {
  *   delay is clamped into [1 minute, 1 hour].
  * - An iteration may stop the loop instead (`stop`).
  * - An iteration that does neither gets one bounded fallback wakeup; if that
- *   fallback iteration also misses, the loop terminates rather than spinning.
+ *   fallback iteration also misses, the task terminates rather than spinning.
+ *
+ * Due-queue guarantees:
+ * - While Pi is busy a due task is only marked in the scheduler's queue; its
+ *   timer keeps advancing on the schedule. Repeated misses for the same task
+ *   coalesce into that one entry instead of replaying a backlog.
+ * - Distinct due tasks flush in a documented deterministic order: earliest
+ *   missed deadline first, ties broken by registration order.
+ * - A task deleted from the registry or via {@link stopTask}, and any callback
+ *   captured before a stop or replacement, is dropped without dispatching.
+ * - {@link flush} stops the moment Pi is busy again — including when a dispatch
+ *   starts work synchronously — and resumes the remaining tasks at the next idle
+ *   boundary, so flushing can never interrupt or re-enter active work.
  *
  * Shared guarantees:
- * - At most one pending run exists; missed occurrences coalesce into it and are
- *   never replayed as a backlog.
- * - A generation counter makes callbacks from a replaced/stopped loop no-ops.
- * - `stop`/`dispose` are idempotent and leave no live timer.
+ * - `stop`, `stopAll`, and `dispose` are idempotent and leave no live timer.
  *
  * Prompt resolution:
  * - The prompt for a run is produced by the injected `resolvePrompt` provider at
@@ -460,17 +504,14 @@ export const systemTimers: SchedulerDeps = {
  *   next wakeup, so the bounded fallback policy applies instead of stalling.
  */
 export class LoopScheduler implements WakeupService {
-  private timer: unknown = null;
-  private generation = 0;
+  private readonly entries = new Map<string, TrackedTask>();
+  private readonly due = new DueQueue();
+  /** The command-owned task, described by {@link status}. */
+  private primaryId: string | undefined;
+  private primarySchedule: FixedSchedule | undefined;
   private disposed = false;
-  private schedule: FixedSchedule | undefined;
-  private taskId: string | undefined;
-  private mode: TaskMode | undefined;
-  private awaitingDecision = false;
-  private fallbackUsed = false;
-  private fallbackDelayMs = DEFAULT_WAKEUP_FALLBACK_MS;
-  /** Monotonic id for the latest self-paced delivery, to ignore stale failures. */
-  private runToken = 0;
+  private nextSeq = 0;
+  private nextToken = 1;
 
   constructor(
     private readonly deps: SchedulerDeps,
@@ -487,12 +528,12 @@ export class LoopScheduler implements WakeupService {
   ) {}
 
   start(intervalMs: number, task: string, options: StartOptions = {}): void {
-    if (this.disposed) {
-      throw new Error("scheduler has been disposed");
-    }
+    this.assertUsable();
     if (!task.trim()) {
       throw new Error("task must not be empty");
     }
+    // A command start replaces the command-owned loop; independently scheduled
+    // tasks (scheduleFixed) keep running.
     this.stop();
     const schedule = createSchedule(intervalMs);
     const created = this.registry.create({
@@ -502,22 +543,45 @@ export class LoopScheduler implements WakeupService {
       schedule,
       nextFireAt: nextFireAt(schedule, this.deps.now()),
     });
-    this.taskId = created.id;
-    this.schedule = schedule;
-    this.mode = "fixed";
-    this.arm(this.generation, created);
+    const entry = this.track(created);
+    this.primaryId = created.id;
+    this.primarySchedule = schedule;
+    this.arm(entry, created);
+  }
+
+  /**
+   * Schedule an additional fixed task without replacing the command-owned loop.
+   *
+   * The task joins the same scheduler-owned due queue and timer bookkeeping, so
+   * it coalesces while busy and flushes in the documented order alongside every
+   * other due task. Returns the created registry snapshot.
+   */
+  scheduleFixed(intervalMs: number, task: string, options: StartOptions = {}): ScheduledTask {
+    this.assertUsable();
+    if (!task.trim()) {
+      throw new Error("task must not be empty");
+    }
+    const schedule = createSchedule(intervalMs);
+    const created = this.registry.create({
+      prompt: task,
+      mode: "fixed",
+      ...(options.maintenance ? { maintenance: true } : {}),
+      schedule,
+      nextFireAt: nextFireAt(schedule, this.deps.now()),
+    });
+    const entry = this.track(created);
+    this.arm(entry, created);
+    return created;
   }
 
   /**
    * Start a self-paced loop. The prompt is due immediately; each delivered
    * iteration is expected to call {@link scheduleNextWakeup} or `stop` before it
    * settles. A missing choice triggers the bounded fallback described on the
-   * class. The task is created in the shared registry with mode `self-paced`.
+   * class. The task becomes the command-owned loop.
    */
   startSelfPaced(prompt: string, options: SelfPacedStartOptions = {}): ScheduledTask {
-    if (this.disposed) {
-      throw new Error("scheduler has been disposed");
-    }
+    this.assertUsable();
     if (!prompt.trim()) {
       throw new Error("task must not be empty");
     }
@@ -529,29 +593,30 @@ export class LoopScheduler implements WakeupService {
       ...(options.maintenance ? { maintenance: true } : {}),
       nextFireAt: this.deps.now(),
     });
-    this.taskId = created.id;
-    this.mode = "self-paced";
-    this.fallbackDelayMs = fallbackDelayMs;
-    this.awaitingDecision = false;
-    this.fallbackUsed = false;
-    this.armSelfPaced(this.generation, created);
+    const entry = this.track(created);
+    entry.fallbackDelayMs = fallbackDelayMs;
+    this.primaryId = created.id;
+    this.primarySchedule = undefined;
+    this.armSelfPaced(entry, created);
     return created;
   }
 
   /**
-   * Schedule the next wakeup of the active self-paced loop.
+   * Schedule the next wakeup of the command-owned self-paced loop.
    *
    * The requested delay is clamped into [1 minute, 1 hour]. An explicit choice
-   * clears the fallback allowance, so the loop cannot be terminated for a miss
-   * that a later iteration fixed. Throws {@link WakeupError} when no self-paced
-   * loop is active or the scheduler is disposed.
+   * clears the fallback allowance and any queued missed run, so the loop cannot
+   * be terminated for a miss that a later iteration fixed. Throws
+   * {@link WakeupError} when no self-paced loop is active or the scheduler is
+   * disposed.
    */
   scheduleNextWakeup(delayMs: number, reason?: string): WakeupDecision {
     if (this.disposed) {
       throw new WakeupError("scheduler has been disposed");
     }
-    const task = this.currentTask();
-    if (!task || task.mode !== "self-paced") {
+    const entry = this.primaryEntry();
+    const task = entry === undefined ? undefined : this.registry.get(entry.id);
+    if (!entry || !task || task.mode !== "self-paced") {
       throw new WakeupError("no self-paced loop is running");
     }
     const delay = clampWakeupDelay(delayMs);
@@ -561,10 +626,11 @@ export class LoopScheduler implements WakeupService {
       pending: false,
       reason: reason ?? null,
     });
-    this.awaitingDecision = false;
-    this.fallbackUsed = false;
-    this.clear();
-    this.armSelfPaced(this.generation, updated);
+    entry.awaitingDecision = false;
+    entry.fallbackUsed = false;
+    this.due.remove(entry.id);
+    this.clearTimer(entry);
+    this.armSelfPaced(entry, updated);
     return {
       requestedMs: delayMs,
       delayMs: delay,
@@ -575,100 +641,190 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * End the current self-paced iteration and apply the bounded fallback policy
-   * when it neither rescheduled nor stopped. Safe to call at every idle boundary
-   * for every mode; returns `{ action: "none" }` when nothing was pending.
+   * End the command-owned self-paced iteration and apply the bounded fallback
+   * policy when it neither rescheduled nor stopped. Safe to call at every idle
+   * boundary for every mode; returns `{ action: "none" }` when nothing awaited.
    */
   settleIteration(): IterationSettleResult {
     if (this.disposed) {
       return { action: "none" };
     }
-    const task = this.currentTask();
-    if (!task || task.mode !== "self-paced" || !this.awaitingDecision) {
+    const entry = this.primaryEntry();
+    const task = entry === undefined ? undefined : this.registry.get(entry.id);
+    if (!entry || !task || task.mode !== "self-paced" || !entry.awaitingDecision) {
       return { action: "none" };
     }
-    this.awaitingDecision = false;
-    return this.applyMissedChoice(task);
+    entry.awaitingDecision = false;
+    return this.applyMissedChoice(entry, task);
   }
 
   /**
-   * Apply the bounded fallback policy for an iteration that produced no next
-   * wakeup: grant one fallback wakeup, then terminate on a second consecutive
-   * miss so a broken loop can never spin forever. Also used when a maintenance
-   * prompt cannot be resolved and no iteration ran to choose a wakeup.
+   * Cancel the command-owned loop. Returns whether one was running. Idempotent;
+   * independently scheduled tasks are unaffected (use {@link stopTask} or
+   * {@link stopAll}).
    */
-  private applyMissedChoice(task: ScheduledTask): IterationSettleResult {
-    if (this.fallbackUsed) {
-      this.stop();
-      return { action: "terminated" };
-    }
-    this.fallbackUsed = true;
-    const delay = clampWakeupDelay(this.fallbackDelayMs);
-    const fallbackAt = this.deps.now() + delay;
-    const updated = this.registry.update(task.id, { nextFireAt: fallbackAt, pending: false, reason: null });
-    this.clear();
-    this.armSelfPaced(this.generation, updated);
-    return { action: "fallback", delayMs: delay, nextFireAt: fallbackAt };
-  }
-
-  /** Cancel the active loop. Returns whether a loop was running. Idempotent. */
   stop(): boolean {
-    const active = this.currentTask() !== undefined;
-    this.generation += 1;
-    this.clear();
-    if (this.taskId !== undefined) {
-      this.registry.delete(this.taskId);
+    const id = this.primaryId;
+    if (id === undefined) {
+      return false;
     }
-    this.taskId = undefined;
-    this.schedule = undefined;
-    this.mode = undefined;
-    this.awaitingDecision = false;
-    this.fallbackUsed = false;
+    const active = this.registry.get(id) !== undefined;
+    this.stopTask(id);
     return active;
   }
 
-  /** Permanently disable the scheduler and drop any timer. Idempotent. */
+  /**
+   * Stop one tracked task: cancel its timer, drop it from the due queue, and
+   * remove it from the registry. Returns whether it was tracked.
+   */
+  stopTask(id: string): boolean {
+    const entry = this.entries.get(id);
+    if (!entry) {
+      return false;
+    }
+    this.removeEntry(entry);
+    if (this.registry.has(id)) {
+      this.registry.delete(id);
+    }
+    return true;
+  }
+
+  /** Stop every tracked task and clear the due queue. Keeps the scheduler usable. */
+  stopAll(): void {
+    for (const entry of [...this.entries.values()]) {
+      this.removeEntry(entry);
+      if (this.registry.has(entry.id)) {
+        this.registry.delete(entry.id);
+      }
+    }
+    this.due.clear();
+    this.primaryId = undefined;
+    this.primarySchedule = undefined;
+  }
+
+  /** Permanently disable the scheduler and drop every timer. Idempotent. */
   dispose(): void {
-    this.stop();
+    this.stopAll();
     this.disposed = true;
   }
 
   /**
-   * Deliver a coalesced pending run when idle. Returns whether a dispatch
-   * happened. Safe to call on every idle signal; a no-op otherwise.
+   * Deliver due tasks while idle, in the scheduler's deterministic order.
+   *
+   * The queue is drained up front, so a run that re-queues itself on failure is
+   * retried at the *next* idle signal rather than spinning inside this call. The
+   * loop re-checks `isIdle()` before every task, so a dispatch that starts work
+   * synchronously stops the flush; the remaining tasks are re-queued in their
+   * original order and resume at the next idle boundary.
+   *
+   * Returns whether at least one task was dispatched.
    */
   flush(): boolean {
     if (this.disposed) {
       return false;
     }
-    const task = this.currentTask();
-    if (!task || !task.pending || !this.isIdle()) {
-      return false;
+    const batch = this.due.drain();
+    let dispatched = false;
+    let index = 0;
+    for (; index < batch.length; index += 1) {
+      if (!this.isIdle()) {
+        break;
+      }
+      const queued = batch[index]!;
+      const entry = this.entries.get(queued.id);
+      const task = this.registry.get(queued.id);
+      if (!entry || !task) {
+        // Deleted from the registry, or never tracked: drop it silently.
+        if (entry) {
+          this.forget(entry);
+        }
+        continue;
+      }
+      if (task.mode === "self-paced") {
+        this.beginSelfPacedRun(entry, task);
+      } else {
+        this.deliverFixed(entry, task);
+      }
+      dispatched = true;
     }
-    if (task.mode === "self-paced") {
-      return this.beginSelfPacedRun(this.generation, task);
+    // Anything we stopped short of (busy again) keeps its place for next idle.
+    for (; index < batch.length; index += 1) {
+      const queued = batch[index]!;
+      if (this.entries.has(queued.id) && this.registry.has(queued.id)) {
+        this.due.mark(queued.id, queued.deadline, queued.seq);
+      }
     }
-    return this.deliverFixed(task, this.generation);
+    return dispatched;
   }
 
   status(): LoopStatus {
-    const task = this.currentTask();
+    const entry = this.primaryEntry();
+    const task = entry === undefined ? undefined : this.registry.get(entry.id);
     const selfPaced = task?.mode === "self-paced";
     return {
       active: task !== undefined,
-      intervalMs: this.schedule?.intervalMs ?? 0,
+      intervalMs: this.primarySchedule?.intervalMs ?? 0,
       task: task?.prompt ?? "",
-      pending: task?.pending ?? false,
+      pending: entry !== undefined && this.due.has(entry.id),
       ...(task === undefined ? {} : { mode: task.mode }),
       ...(task?.maintenance ? { maintenance: true } : {}),
-      ...(selfPaced ? { awaitingDecision: this.awaitingDecision, fallbackUsed: this.fallbackUsed } : {}),
+      ...(selfPaced && entry ? { awaitingDecision: entry.awaitingDecision, fallbackUsed: entry.fallbackUsed } : {}),
       ...(task?.reason === undefined ? {} : { reason: task.reason }),
-      ...(this.schedule === undefined ? {} : { schedule: this.schedule }),
+      ...(this.primarySchedule === undefined ? {} : { schedule: this.primarySchedule }),
     };
   }
 
-  private currentTask(): ScheduledTask | undefined {
-    return this.taskId === undefined ? undefined : this.registry.get(this.taskId);
+  /** IDs of every currently due task, in flush order. */
+  dueTaskIds(): string[] {
+    return this.due.list().map((entry) => entry.id);
+  }
+
+  /** IDs of every task the scheduler is tracking, in registration order. */
+  trackedTaskIds(): string[] {
+    return [...this.entries.keys()];
+  }
+
+  private assertUsable(): void {
+    if (this.disposed) {
+      throw new Error("scheduler has been disposed");
+    }
+  }
+
+  private primaryEntry(): TrackedTask | undefined {
+    return this.primaryId === undefined ? undefined : this.entries.get(this.primaryId);
+  }
+
+  private track(task: ScheduledTask): TrackedTask {
+    const entry: TrackedTask = {
+      id: task.id,
+      seq: this.nextSeq++,
+      token: this.nextToken++,
+      timer: null,
+      awaitingDecision: false,
+      fallbackUsed: false,
+      fallbackDelayMs: DEFAULT_WAKEUP_FALLBACK_MS,
+      runToken: 0,
+    };
+    this.entries.set(task.id, entry);
+    return entry;
+  }
+
+  /** Remove an entry's timer and bookkeeping, and clear it from the due queue. */
+  private removeEntry(entry: TrackedTask): void {
+    if (this.entries.get(entry.id) === entry) {
+      this.entries.delete(entry.id);
+    }
+    this.clearTimer(entry);
+    this.due.remove(entry.id);
+    if (this.primaryId === entry.id) {
+      this.primaryId = undefined;
+      this.primarySchedule = undefined;
+    }
+  }
+
+  /** Drop an entry whose registry task has disappeared, without touching the registry. */
+  private forget(entry: TrackedTask): void {
+    this.removeEntry(entry);
   }
 
   /**
@@ -676,101 +832,130 @@ export class LoopScheduler implements WakeupService {
    * stored schedule, so arming late (after a slow tick or a clock jump) skips
    * missed boundaries instead of shifting the schedule.
    */
-  private arm(generation: number, task: ScheduledTask): void {
-    if (generation !== this.generation) {
+  private arm(entry: TrackedTask, task: ScheduledTask): void {
+    if (this.entries.get(entry.id) !== entry) {
       return;
     }
-    const schedule = this.registry.get(task.id)?.schedule ?? task.schedule;
+    const schedule = this.registry.get(entry.id)?.schedule ?? task.schedule;
     if (!schedule) {
       return;
     }
+    this.clearTimer(entry);
     const now = this.deps.now();
     const due =
       task.nextFireAt !== undefined && task.nextFireAt > now ? task.nextFireAt : nextFireAt(schedule, now);
     if (due !== task.nextFireAt) {
-      this.registry.update(task.id, { nextFireAt: due });
+      this.registry.update(entry.id, { nextFireAt: due });
     }
-    this.timer = this.deps.setTimer(() => {
-      this.timer = null;
-      this.onTick(generation);
-    }, due - now);
+    this.armTimer(entry, due - now);
   }
 
   /** Arm a one-shot timer for the self-paced task's stored `nextFireAt`. */
-  private armSelfPaced(generation: number, task: ScheduledTask): void {
-    if (generation !== this.generation) {
+  private armSelfPaced(entry: TrackedTask, task: ScheduledTask): void {
+    if (this.entries.get(entry.id) !== entry) {
       return;
     }
-    const current = this.registry.get(task.id);
+    const current = this.registry.get(entry.id);
     if (!current || current.mode !== "self-paced") {
       return;
     }
+    this.clearTimer(entry);
     const now = this.deps.now();
     const due = current.nextFireAt ?? now;
-    this.timer = this.deps.setTimer(() => {
-      this.timer = null;
-      this.onTick(generation);
-    }, Math.max(0, due - now));
+    this.armTimer(entry, Math.max(0, due - now));
   }
 
-  private onTick(generation: number): void {
-    if (generation !== this.generation) {
-      return;
-    }
-    const task = this.currentTask();
+  private armTimer(entry: TrackedTask, delayMs: number): void {
+    const token = entry.token;
+    entry.timer = this.deps.setTimer(() => {
+      entry.timer = null;
+      // A replaced task has a fresh entry (and token); a stopped task has none.
+      if (this.entries.get(entry.id) !== entry || entry.token !== token) {
+        return;
+      }
+      this.onTick(entry);
+    }, delayMs);
+  }
+
+  private onTick(entry: TrackedTask): void {
+    const task = this.registry.get(entry.id);
     if (!task) {
+      this.forget(entry);
       return;
     }
     if (task.mode === "self-paced") {
-      this.onSelfPacedTick(generation, task);
+      this.onSelfPacedTick(entry, task);
       return;
     }
     if (!task.schedule) {
       return;
     }
     if (this.isIdle()) {
-      this.deliverFixed(task, generation);
+      this.deliverFixed(entry, task);
     } else {
-      this.registry.update(task.id, { pending: true });
+      // Busy: record the miss in the scheduler's queue and keep the schedule.
+      this.markDue(entry, task.nextFireAt ?? this.deps.now());
     }
-    // Dispatch may have stopped or replaced the loop; do not re-arm then.
-    if (generation !== this.generation) {
+    // Dispatch may have stopped or replaced this task; do not re-arm then.
+    if (this.entries.get(entry.id) !== entry) {
       return;
     }
-    const current = this.currentTask();
+    const current = this.registry.get(entry.id);
     if (!current || !current.schedule) {
       return;
     }
     // Boundaries are absolute, so derive the next one from the schedule rather
-    // than from the tick time. Missed boundaries collapse into the current run.
+    // than from the tick time. Missed boundaries collapse into the one queue
+    // entry already recorded.
     const due = nextFireAt(current.schedule, this.deps.now());
     const advanced = this.registry.update(current.id, { nextFireAt: due });
-    this.arm(generation, advanced);
+    this.arm(entry, advanced);
   }
 
   /**
    * A self-paced wakeup came due. Deliver it now when idle, otherwise mark it
-   * pending so the next idle signal flushes it. No timer is re-armed: the next
+   * due so the next idle signal flushes it. No timer is re-armed: the next
    * wakeup is chosen by the iteration that is about to run.
    */
-  private onSelfPacedTick(generation: number, task: ScheduledTask): void {
+  private onSelfPacedTick(entry: TrackedTask, task: ScheduledTask): void {
     if (this.isIdle()) {
-      this.beginSelfPacedRun(generation, task);
+      this.beginSelfPacedRun(entry, task);
     } else {
-      this.registry.update(task.id, { pending: true });
+      this.markDue(entry, task.nextFireAt ?? this.deps.now());
+    }
+  }
+
+  /** Record a missed run in the scheduler queue, coalescing a repeat. */
+  private markDue(entry: TrackedTask, deadline: number): void {
+    if (this.entries.get(entry.id) !== entry) {
+      return;
+    }
+    if (this.due.mark(entry.id, deadline, entry.seq)) {
+      this.setPending(entry.id, true);
+    }
+  }
+
+  /** Mirror the queue state onto the registry record for status/diagnostics. */
+  private setPending(id: string, pending: boolean): void {
+    if (this.registry.has(id)) {
+      this.registry.update(id, { pending });
     }
   }
 
   /**
-   * Deliver a due fixed run: resolve its prompt, clear the pending flag, and
+   * Deliver a due fixed run: resolve its prompt, clear its queued state, and
    * dispatch. Returns whether a dispatch was attempted.
    *
    * A prompt that cannot be resolved is reported and this run is skipped; the
    * schedule has already advanced, so the next boundary retries without
-   * retaining a pending run or spamming retries.
+   * retaining a queued run or spamming retries.
    */
-  private deliverFixed(task: ScheduledTask, generation: number): boolean {
-    const updated = this.registry.update(task.id, { pending: false });
+  private deliverFixed(entry: TrackedTask, task: ScheduledTask): boolean {
+    this.due.remove(entry.id);
+    if (this.entries.get(entry.id) !== entry || !this.registry.has(entry.id)) {
+      return false;
+    }
+    const updated = this.registry.update(entry.id, { pending: false });
     let prompt: string;
     try {
       prompt = this.resolvePrompt(updated);
@@ -778,13 +963,13 @@ export class LoopScheduler implements WakeupService {
       this.onError?.(error);
       return false;
     }
-    this.safeDispatch(updated, prompt, generation);
+    this.safeDispatch(updated, prompt, entry);
     return true;
   }
 
   /**
    * Dispatch one self-paced run and mark the iteration as awaiting a choice.
-   * Returns false (and leaves the run pending for retry) when delivery throws.
+   * Returns false (and leaves the run queued for retry) when delivery throws.
    *
    * The awaiting flag is set *before* dispatch so a dispatch that synchronously
    * reschedules (which clears the flag and arms the next timer) is not
@@ -794,69 +979,98 @@ export class LoopScheduler implements WakeupService {
    * wakeup can be chosen; the bounded fallback policy applies so a resolution
    * failure cannot stall the loop.
    */
-  private beginSelfPacedRun(generation: number, task: ScheduledTask): boolean {
+  private beginSelfPacedRun(entry: TrackedTask, task: ScheduledTask): boolean {
+    this.due.remove(entry.id);
     let prompt: string;
     try {
       prompt = this.resolvePrompt(task);
     } catch (error) {
       this.onError?.(error);
-      const settled = this.applyMissedChoice(task);
+      const settled = this.applyMissedChoice(entry, task);
       return settled.action === "fallback";
     }
-    const updated = this.registry.update(task.id, { pending: false });
-    this.runToken += 1;
-    this.awaitingDecision = true;
-    const delivered = this.safeDispatch(updated, prompt, generation, this.runToken);
+    if (this.entries.get(entry.id) !== entry || !this.registry.has(entry.id)) {
+      return false;
+    }
+    const updated = this.registry.update(entry.id, { pending: false });
+    entry.runToken += 1;
+    entry.awaitingDecision = true;
+    const delivered = this.safeDispatch(updated, prompt, entry, entry.runToken);
     // A synchronous dispatch error clears the flag in onDispatchError; a
-    // replacement/stop during dispatch owns the flag already, so leave it.
-    if (delivered && generation === this.generation && this.currentTask()?.id === task.id) {
+    // replacement/stop during dispatch owns the entry already, so leave it.
+    if (delivered && this.entries.get(entry.id) === entry && this.registry.get(entry.id)?.id === task.id) {
       return true;
     }
     return false;
   }
 
+  /**
+   * Apply the bounded fallback policy for an iteration that produced no next
+   * wakeup: grant one fallback wakeup, then remove the task on a second
+   * consecutive miss so a broken loop can never spin forever. Also used when a
+   * maintenance prompt cannot be resolved and no iteration ran to choose a
+   * wakeup.
+   */
+  private applyMissedChoice(entry: TrackedTask, task: ScheduledTask): IterationSettleResult {
+    if (this.entries.get(entry.id) !== entry) {
+      return { action: "none" };
+    }
+    if (entry.fallbackUsed) {
+      this.stopTask(entry.id);
+      return { action: "terminated" };
+    }
+    entry.fallbackUsed = true;
+    const delay = clampWakeupDelay(entry.fallbackDelayMs);
+    const fallbackAt = this.deps.now() + delay;
+    const updated = this.registry.update(entry.id, { nextFireAt: fallbackAt, pending: false, reason: null });
+    this.due.remove(entry.id);
+    this.clearTimer(entry);
+    this.armSelfPaced(entry, updated);
+    return { action: "fallback", delayMs: delay, nextFireAt: fallbackAt };
+  }
+
   /** Dispatch a task snapshot and its resolved prompt. Returns false on a synchronous throw. */
-  private safeDispatch(task: ScheduledTask, prompt: string, generation: number, token?: number): boolean {
+  private safeDispatch(task: ScheduledTask, prompt: string, entry: TrackedTask, token?: number): boolean {
     try {
       const result = this.dispatch(task, prompt);
       if (result && typeof (result as Promise<void>).then === "function") {
         void (result as Promise<void>).catch((error) => {
-          this.onDispatchError(error, generation, token);
+          this.onDispatchError(error, entry, token);
         });
       }
       return true;
     } catch (error) {
-      this.onDispatchError(error, generation, token);
+      this.onDispatchError(error, entry, token);
       return false;
     }
   }
 
-  private onDispatchError(error: unknown, generation: number, token?: number): void {
-    // Retain at most one pending run and retry only at the next tick or idle
-    // signal, so a failing dispatch can never spin. A rejection from a task
+  private onDispatchError(error: unknown, entry: TrackedTask, token?: number): void {
+    // Retain at most one queued run per task and retry only at the next tick or
+    // idle signal, so a failing dispatch can never spin. A rejection from a task
     // that has since been stopped or replaced must not requeue its successor,
-    // so requeue only when the failing dispatch's generation is still current.
-    if (generation === this.generation) {
-      const task = this.currentTask();
+    // so requeue only when the failing dispatch's entry is still current.
+    if (this.entries.get(entry.id) === entry) {
+      const task = this.registry.get(entry.id);
       if (task?.mode === "self-paced") {
         // Only the iteration that is still awaiting a choice may be recovered,
         // so a late rejection cannot requeue a run whose iteration already
         // rescheduled or one from a previous run.
-        if (token !== undefined && token === this.runToken && this.awaitingDecision && !task.pending) {
-          this.registry.update(task.id, { pending: true });
-          this.awaitingDecision = false;
+        if (token !== undefined && token === entry.runToken && entry.awaitingDecision && !this.due.has(entry.id)) {
+          entry.awaitingDecision = false;
+          this.markDue(entry, task.nextFireAt ?? this.deps.now());
         }
-      } else if (task && !task.pending) {
-        this.registry.update(task.id, { pending: true });
+      } else if (task && !this.due.has(entry.id)) {
+        this.markDue(entry, task.nextFireAt ?? this.deps.now());
       }
     }
     this.onError?.(error);
   }
 
-  private clear(): void {
-    if (this.timer !== null) {
-      this.deps.clearTimer(this.timer);
-      this.timer = null;
+  private clearTimer(entry: TrackedTask): void {
+    if (entry.timer !== null) {
+      this.deps.clearTimer(entry.timer);
+      entry.timer = null;
     }
   }
 }

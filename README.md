@@ -73,6 +73,26 @@ The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
 command, and Pi's usual tool permissions apply.
 
+### Due queue and flush order
+
+While Pi is busy, a due run is neither delivered nor lost. The scheduler records
+it in a per-session **due queue that the scheduler owns** — one entry per task,
+independent of the task registry's `pending` mirror. The task's timer keeps
+advancing on its schedule, so repeated misses for the same task **coalesce into
+the single entry already queued** instead of replaying a backlog.
+
+At the next idle boundary (`agent_settled`), the scheduler flushes every distinct
+due task in a deterministic order:
+
+1. The **earliest missed deadline** first.
+2. Ties (simultaneous deadlines) broken by the order the scheduler began tracking
+   the task.
+
+A flush stops as soon as Pi is busy again — including when a dispatch starts work
+synchronously — and the undispatched tasks keep their place for the next idle
+boundary. A task deleted from the registry (or stopped), and any timer callback
+captured before a stop or replacement, is dropped without dispatching.
+
 ### Scheduled-prompt dispatch
 
 Every scheduled run — fixed, self-paced, and maintenance — is delivered through
@@ -205,18 +225,21 @@ ignore the file.
   `now + interval`. A late timer, a long agent turn, or a clock jump never
   shifts later boundaries. The first run is at the next boundary, so a `5min`
   loop started at 12:03 first runs at 12:05.
-- **One loop per session.** Creating a new loop replaces the old one and cancels
-  its timer. Behind the command, the active loop is stored as a single `fixed`
-  or `self-paced` task in a per-session task registry with a stable ID, its
-  timing state, and a computed `nextFireAt`. Later changes build on this for
-  multiple concurrent, self-paced, and persisted tasks.
+- **One command loop per session.** Creating a new loop with `/loop` replaces the
+  old one and cancels its timer. Behind the command, the scheduler tracks that
+  command-owned loop as a `fixed` or `self-paced` task in a per-session task
+  registry with a stable ID, its timing state, and a computed `nextFireAt`. The
+  scheduler can also track independent fixed tasks via `scheduleFixed`, and each
+  task keeps its own timer and due-queue entry.
 - **Self-paced wakeups are relative and clamped.** A self-paced iteration's
   requested delay is measured from when it asks, clamped into 1 minute–1 hour,
   and stored with an optional reason. A missing choice gets one bounded fallback
   wakeup; a second consecutive miss terminates the loop.
 - **Missed runs coalesce; no backlog.** If Pi is busy when a boundary or wakeup
-  is due, the run becomes pending and is delivered once Pi is idle again.
-  Occurrences are never replayed one-per-missed-interval.
+  is due, the scheduler marks the task in its own due queue and delivers one run
+  once Pi is idle again. Repeated misses for the same task coalesce, and distinct
+  due tasks flush in the documented order (earliest missed deadline first, ties
+  by registration). Occurrences are never replayed one-per-missed-interval.
 - **In-memory only.** Loops do not survive restart, reload, or session
   replacement, and they do not run while Pi is closed.
 - **Stopping does not abort work already running.** It prevents future loop
@@ -254,6 +277,7 @@ The logic is split so it can be tested without Pi:
 | Module | Responsibility |
 |---|---|
 | `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, injected clock and dispatch). |
+| `src/due-queue.ts` | Scheduler-owned per-task due queue: coalesces repeated misses and defines the deterministic flush order (earliest missed deadline, ties by registration). |
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps) and `nextFireAt` boundary calculation. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
@@ -268,7 +292,10 @@ command executes; skills and templates expand; otherwise the text is literal).
 Scheduler and adapter tests never sleep — they drive time explicitly and assert
 boundary alignment, normalization, coalescing, long busy periods, clock jumps,
 replacement, stop, dispatch errors, cleanup, and the self-paced reschedule,
-clamp, bounded-fallback, termination, and stale-callback paths. Maintenance
+clamp, bounded-fallback, termination, and stale-callback paths. Due-queue
+coverage adds per-task coalescing, deterministic flush order for two distinct
+tasks and simultaneous deadlines, long busy windows, deleted/stopped tasks and
+stale callbacks, and flush reentrancy when a dispatch starts work. Maintenance
 coverage adds file lookup and precedence, missing/unreadable/empty files,
 byte-bounded truncation, custom-prompt isolation, dynamic reload, both command
 forms, and per-run prompt resolution on the scheduler. Dispatch coverage adds
