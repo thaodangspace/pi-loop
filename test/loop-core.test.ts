@@ -86,14 +86,17 @@ test("interval units accept singular, plural, and abbreviated spellings", () => 
   assert.equal(parseInterval("5min"), 300_000);
   assert.equal(parseInterval("1hour"), 3_600_000);
   assert.equal(parseInterval("3hours"), 10_800_000);
+  assert.equal(parseInterval("1d"), 86_400_000);
+  assert.equal(parseInterval("2days"), 172_800_000);
 });
 
 test("invalid intervals are rejected", () => {
-  for (const bad of ["", "0s", "0min", "-5min", "1.5h", "5x", "min", "5", "1h30min"]) {
+  for (const bad of ["", "0s", "0min", "-5min", "1.5h", "5x", "min", "5", "1h30min", "1w"]) {
     assert.throws(() => parseInterval(bad), IntervalError, `expected ${JSON.stringify(bad)} to fail`);
   }
   assert.throws(() => parseInterval("99999999999999999999h"), /too large|positive/);
   assert.throws(() => parseInterval("2147484s"), /too large/);
+  assert.throws(() => parseInterval("25d"), /too large/);
 });
 
 test("malformed /loop commands return usage without a task", () => {
@@ -142,33 +145,85 @@ test("formatInterval uses the largest exact unit", () => {
   assert.equal(formatInterval(60_000), "1min");
   assert.equal(formatInterval(90_000), "90s");
   assert.equal(formatInterval(3_600_000), "1h");
+  assert.equal(formatInterval(86_400_000), "1d");
+  assert.equal(formatInterval(2 * 86_400_000), "2d");
 });
 
-test("the first tick fires one full interval after start", () => {
+test("the first tick fires at the next cadence boundary, never immediately", () => {
   const timers = new FakeTimers();
   const dispatched: string[] = [];
   const scheduler = new LoopScheduler(timers, testRegistry(timers), (task) => {
       dispatched.push(task.prompt);
     }, () => true);
 
-  scheduler.start(1_000, "ping");
-  timers.advance(999);
+  scheduler.start(60_000, "ping");
+  timers.advance(59_999);
   assert.deepEqual(dispatched, []);
   timers.advance(1);
   assert.deepEqual(dispatched, ["ping"]);
 });
 
-test("the loop repeats on each interval until stopped", () => {
+test("the loop repeats on each boundary until stopped", () => {
   const timers = new FakeTimers();
   const dispatched: string[] = [];
   const scheduler = new LoopScheduler(timers, testRegistry(timers), (task) => {
       dispatched.push(task.prompt);
     }, () => true);
 
-  scheduler.start(1_000, "tick");
-  timers.advance(3_000);
+  scheduler.start(60_000, "tick");
+  timers.advance(3 * 60_000);
   assert.deepEqual(dispatched, ["tick", "tick", "tick"]);
   assert.equal(timers.pendingCount, 1, "exactly one timer stays armed");
+});
+
+test("the scheduler reports the normalized cadence for a sub-minute interval", () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const scheduler = new LoopScheduler(timers, registry, () => {}, () => true);
+
+  scheduler.start(5_000, "fast");
+  assert.equal(scheduler.status().intervalMs, 60_000, "5s normalizes to the 1min cadence");
+  assert.equal(registry.list()[0]?.schedule?.intervalMs, 60_000);
+  assert.equal(registry.list()[0]?.nextFireAt, 60_000, "the first boundary is one cadence step out");
+
+  scheduler.start(7 * 60_000, "awkward");
+  assert.equal(scheduler.status().intervalMs, 6 * 60_000, "7m normalizes to 6m");
+  scheduler.start(86_400_000, "daily");
+  assert.equal(scheduler.status().intervalMs, 86_400_000, "day intervals are supported");
+});
+
+test("daily boundaries stay aligned across days", () => {
+  const timers = new FakeTimers();
+  const dispatched: string[] = [];
+  const registry = testRegistry(timers);
+  const scheduler = new LoopScheduler(timers, registry, (task) => {
+      dispatched.push(task.prompt);
+    }, () => true);
+
+  scheduler.start(86_400_000, "daily");
+  assert.equal(registry.list()[0]?.nextFireAt, 86_400_000);
+  timers.advance(86_400_000);
+  assert.deepEqual(dispatched, ["daily"]);
+  assert.equal(registry.list()[0]?.nextFireAt, 2 * 86_400_000);
+});
+
+test("boundaries are absolute, so restarting does not reset the grid", () => {
+  const timers = new FakeTimers();
+  const dispatched: string[] = [];
+  const registry = testRegistry(timers);
+  const scheduler = new LoopScheduler(timers, registry, (task) => {
+      dispatched.push(task.prompt);
+    }, () => true);
+
+  timers.clock = 90_000;
+  scheduler.start(5 * 60_000, "aligned");
+  assert.equal(registry.list()[0]?.nextFireAt, 5 * 60_000, "the next 5-minute boundary, not start + 5m");
+
+  timers.advance(209_999);
+  assert.deepEqual(dispatched, [], "the first run is not immediate");
+  timers.advance(1);
+  assert.deepEqual(dispatched, ["aligned"]);
+  assert.equal(registry.list()[0]?.nextFireAt, 10 * 60_000);
 });
 
 test("busy ticks coalesce into a single pending run flushed once idle", () => {
@@ -180,10 +235,10 @@ test("busy ticks coalesce into a single pending run flushed once idle", () => {
       dispatched.push(task.prompt);
     }, () => idle);
 
-  scheduler.start(1_000, "ping");
-  timers.advance(1_000);
-  timers.advance(1_000);
-  timers.advance(1_000);
+  scheduler.start(60_000, "ping");
+  timers.advance(60_000);
+  timers.advance(60_000);
+  timers.advance(60_000);
   assert.deepEqual(dispatched, [], "busy ticks must not dispatch");
   assert.equal(scheduler.status().pending, true);
   assert.equal(registry.list()[0]?.pending, true, "the registry records the queued run");
@@ -197,6 +252,53 @@ test("busy ticks coalesce into a single pending run flushed once idle", () => {
   assert.equal(timers.pendingCount, 1, "the periodic timer is still armed");
 });
 
+test("a long busy period does not drift boundaries or accumulate a backlog", () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const dispatched: string[] = [];
+  let idle = false;
+  const scheduler = new LoopScheduler(timers, registry, (task) => {
+      dispatched.push(task.prompt);
+    }, () => idle);
+
+  scheduler.start(60_000, "poll");
+  idle = false;
+  timers.advance(5 * 60_000);
+  assert.deepEqual(dispatched, [], "no run while busy");
+  assert.equal(registry.list()[0]?.nextFireAt, 6 * 60_000, "boundaries advanced with the grid, not the completion time");
+
+  idle = true;
+  assert.equal(scheduler.flush(), true);
+  assert.deepEqual(dispatched, ["poll"], "five missed boundaries collapse into one run");
+
+  // The next boundary is unchanged by how long the flush took.
+  timers.advance(60_000);
+  assert.deepEqual(dispatched, ["poll", "poll"]);
+  assert.equal(registry.list()[0]?.nextFireAt, 7 * 60_000);
+});
+
+test("a clock jump delivers one coalesced run and resumes on the grid", () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const dispatched: string[] = [];
+  const scheduler = new LoopScheduler(timers, registry, (task) => {
+      dispatched.push(task.prompt);
+    }, () => true);
+
+  scheduler.start(60_000, "jump");
+  assert.equal(registry.list()[0]?.nextFireAt, 60_000);
+
+  // Simulate the process sleeping through ten minutes.
+  timers.sleep(10 * 60_000);
+  timers.advance(0);
+
+  assert.deepEqual(dispatched, ["jump"], "ten missed boundaries collapse into one run");
+  assert.equal(registry.list()[0]?.nextFireAt, 11 * 60_000, "the next boundary is the first future grid point");
+
+  timers.advance(60_000);
+  assert.deepEqual(dispatched, ["jump", "jump"]);
+});
+
 test("replacing a loop cancels the old timer and stale callbacks", () => {
   const timers = new FakeTimers();
   const registry = testRegistry(timers);
@@ -205,17 +307,17 @@ test("replacing a loop cancels the old timer and stale callbacks", () => {
       dispatched.push(task.prompt);
     }, () => true);
 
-  scheduler.start(1_000, "old");
+  scheduler.start(60_000, "old");
   const oldId = registry.list()[0]!.id;
-  timers.advance(500);
-  scheduler.start(1_000, "new");
+  timers.advance(30_000);
+  scheduler.start(60_000, "new");
   assert.equal(registry.size, 1, "replacement leaves exactly one task");
   const newId = registry.list()[0]!.id;
   assert.notEqual(newId, oldId, "the replacement gets a fresh stable ID");
   assert.equal(registry.has(oldId), false, "the replaced task is removed");
-  timers.advance(500);
+  timers.advance(29_999);
   assert.deepEqual(dispatched, [], "the replaced loop's first tick must not fire");
-  timers.advance(500);
+  timers.advance(1);
   assert.deepEqual(dispatched, ["new"]);
 });
 
@@ -249,15 +351,15 @@ test("stop is idempotent, cancels the timer, and drops pending work", () => {
       dispatched.push(task.prompt);
     }, () => idle);
 
-  scheduler.start(1_000, "ping");
-  timers.advance(1_000);
+  scheduler.start(60_000, "ping");
+  timers.advance(60_000);
   assert.equal(scheduler.stop(), true);
   assert.equal(timers.pendingCount, 0);
   assert.equal(registry.size, 0, "stopping removes the task from the registry");
   assert.equal(scheduler.stop(), false, "stopping twice reports no active loop");
   idle = true;
   assert.equal(scheduler.flush(), false);
-  timers.advance(5_000);
+  timers.advance(5 * 60_000);
   assert.deepEqual(dispatched, []);
   assert.equal(scheduler.status().active, false);
 });
@@ -266,11 +368,11 @@ test("disposal is idempotent and blocks future starts", () => {
   const timers = new FakeTimers();
   const scheduler = new LoopScheduler(timers, testRegistry(timers), () => {}, () => true);
 
-  scheduler.start(1_000, "ping");
+  scheduler.start(60_000, "ping");
   scheduler.dispose();
   scheduler.dispose();
   assert.equal(timers.pendingCount, 0);
-  assert.throws(() => scheduler.start(1_000, "again"), /disposed/);
+  assert.throws(() => scheduler.start(60_000, "again"), /disposed/);
 });
 
 test("a throwing dispatch is reported, retained as one pending run, and retried once", () => {
@@ -290,16 +392,16 @@ test("a throwing dispatch is reported, retained as one pending run, and retried 
     (error) => errors.push(error),
   );
 
-  scheduler.start(1_000, "ping");
-  timers.advance(1_000);
+  scheduler.start(60_000, "ping");
+  timers.advance(60_000);
   assert.equal(errors.length, 1);
   assert.deepEqual(dispatched, [], "a failed dispatch must not also deliver");
   assert.equal(scheduler.status().pending, true, "the run stays pending for a bounded retry");
   assert.equal(registry.list()[0]?.pending, true, "the registry records the retry");
 
-  timers.advance(1_000);
+  timers.advance(60_000);
   fail = false;
-  timers.advance(1_000);
+  timers.advance(60_000);
   assert.deepEqual(dispatched, ["ok"]);
   assert.equal(scheduler.status().pending, false);
 });
@@ -307,7 +409,7 @@ test("a throwing dispatch is reported, retained as one pending run, and retried 
 test("start rejects an empty task", () => {
   const timers = new FakeTimers();
   const scheduler = new LoopScheduler(timers, testRegistry(timers), () => {}, () => true);
-  assert.throws(() => scheduler.start(1_000, "   "), /empty/);
+  assert.throws(() => scheduler.start(60_000, "   "), /empty/);
 });
 
 test("the active loop is represented as a fixed registry task with injected time", () => {
@@ -316,20 +418,21 @@ test("the active loop is represented as a fixed registry task with injected time
   const registry = testRegistry(timers);
   const scheduler = new LoopScheduler(timers, registry, () => {}, () => true);
 
-  scheduler.start(5_000, "check deploy");
+  scheduler.start(5 * 60_000, "check deploy");
   const [task] = registry.list();
   assert.ok(task, "start registers a task");
   assert.equal(task.id, "t1");
   assert.equal(task.prompt, "check deploy");
   assert.equal(task.mode, "fixed");
   assert.equal(task.createdAt, 10_000, "createdAt comes from the injected clock");
-  assert.equal(task.nextFireAt, 15_000, "nextFireAt is one interval after start");
+  assert.deepEqual(task.schedule, { intervalMs: 5 * 60_000, anchor: 0 }, "the schedule is stored on the task");
+  assert.equal(task.nextFireAt, 5 * 60_000, "the next boundary is on the cadence grid");
   assert.equal(task.pending, false);
 
-  timers.advance(5_000);
+  timers.advance(5 * 60_000 - 10_000);
   const [afterTick] = registry.list();
   assert.equal(afterTick!.id, task.id, "the ID is stable across ticks");
-  assert.equal(afterTick!.nextFireAt, 20_000, "the next fire time advances with the clock");
+  assert.equal(afterTick!.nextFireAt, 10 * 60_000, "the next boundary advances one cadence step");
 
   scheduler.stop();
   assert.equal(registry.size, 0);
@@ -343,12 +446,13 @@ test("a registry-backed dispatch receives the full task record", () => {
       received.push(task);
     }, () => true);
 
-  scheduler.start(1_000, "ping");
-  timers.advance(1_000);
+  scheduler.start(60_000, "ping");
+  timers.advance(60_000);
   assert.equal(received.length, 1);
   assert.equal(received[0]!.id, "t1");
   assert.equal(received[0]!.prompt, "ping");
   assert.equal(received[0]!.mode, "fixed");
+  assert.equal(received[0]!.schedule?.intervalMs, 60_000, "the snapshot carries the schedule");
   assert.equal(received[0]!.pending, false, "the snapshot matches the authoritative registry");
 });
 
@@ -361,8 +465,8 @@ test("flush dispatches the snapshot with pending already cleared", () => {
       received.push(task);
     }, () => idle);
 
-  scheduler.start(1_000, "ping");
-  timers.advance(1_000);
+  scheduler.start(60_000, "ping");
+  timers.advance(60_000);
   assert.equal(registry.list()[0]!.pending, true, "a busy tick is queued");
 
   idle = true;
@@ -382,12 +486,12 @@ test("a rejected dispatch from a replaced task cannot requeue the new task", asy
     () => true,
   );
 
-  scheduler.start(1_000, "old");
-  timers.advance(1_000);
+  scheduler.start(60_000, "old");
+  timers.advance(60_000);
   assert.equal(rejectors.length, 1, "the old task dispatched an async run");
 
   // Replace the loop before the old dispatch promise settles.
-  scheduler.start(1_000, "new");
+  scheduler.start(60_000, "new");
   const newId = registry.list()[0]!.id;
   assert.equal(registry.get(newId)?.pending, false);
 
@@ -399,10 +503,10 @@ test("a rejected dispatch from a replaced task cannot requeue the new task", asy
     false,
     "a stale rejection must not mark the replacement task pending",
   );
-  assert.equal(scheduler.flush(), false, "the replacement must not run before its first interval");
+  assert.equal(scheduler.flush(), false, "the replacement must not run before its first boundary");
 
-  // The replacement's own first run still happens one full interval after start.
-  timers.advance(1_000);
+  // The replacement's own first run still happens on the cadence grid.
+  timers.advance(60_000);
   assert.equal(rejectors.length, 2, "the replacement fires on schedule, never early");
 });
 

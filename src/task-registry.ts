@@ -11,6 +11,7 @@
  * tools build on this service rather than creating separate schedulers.
  */
 import { randomUUID } from "node:crypto";
+import type { FixedSchedule } from "./schedule.ts";
 
 /** How a task decides when it should run next. */
 export type TaskMode = "fixed" | "self-paced" | "one-shot";
@@ -27,6 +28,11 @@ export interface ScheduledTask {
   readonly mode: TaskMode;
   /** Creation time from the injected clock. */
   readonly createdAt: number;
+  /**
+   * Schedule representation for fixed tasks: the normalized cadence and the
+   * boundary anchor. Absent for self-paced and one-shot tasks.
+   */
+  readonly schedule?: FixedSchedule;
   /** When the task is next due, if a schedule has been computed yet. */
   readonly nextFireAt?: number;
   /** True when a run was missed while busy and is queued for the next idle moment. */
@@ -37,16 +43,18 @@ export interface ScheduledTask {
 export interface NewTask {
   prompt: string;
   mode: TaskMode;
+  schedule?: FixedSchedule;
   nextFireAt?: number;
 }
 
 /**
- * A partial update to an existing task. Use `nextFireAt: null` to clear the
- * value; omitting a field leaves it unchanged.
+ * A partial update to an existing task. Use `nextFireAt: null` (or
+ * `schedule: null`) to clear the value; omitting a field leaves it unchanged.
  */
 export interface TaskUpdate {
   prompt?: string;
   pending?: boolean;
+  schedule?: FixedSchedule | null;
   nextFireAt?: number | null;
 }
 
@@ -107,6 +115,15 @@ function assertPrompt(prompt: string): void {
 }
 
 /**
+ * Freeze a private copy of a schedule so a caller cannot mutate registry state
+ * by holding a reference to the object it passed in. The store stays shallow
+ * until this point; this makes the nested value immutable too.
+ */
+function freezeSchedule(schedule: FixedSchedule): FixedSchedule {
+  return Object.freeze({ intervalMs: schedule.intervalMs, anchor: schedule.anchor });
+}
+
+/**
  * In-memory registry of scheduled tasks scoped to a single session.
  *
  * Design guarantees:
@@ -160,6 +177,7 @@ export class TaskRegistry {
       prompt: input.prompt,
       mode: input.mode,
       createdAt: this.now(),
+      ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
       ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
       pending: false,
     });
@@ -212,12 +230,19 @@ export class TaskRegistry {
         : update.nextFireAt === null
           ? undefined
           : update.nextFireAt;
+    const schedule =
+      update.schedule === undefined
+        ? current.schedule
+        : update.schedule === null
+          ? undefined
+          : freezeSchedule(update.schedule);
     const next: ScheduledTask = Object.freeze({
       id: current.id,
       prompt: update.prompt ?? current.prompt,
       mode: current.mode,
       createdAt: current.createdAt,
       pending: update.pending ?? current.pending,
+      ...(schedule === undefined ? {} : { schedule }),
       ...(nextFireAt === undefined ? {} : { nextFireAt }),
     });
     this.tasks.set(id, next);

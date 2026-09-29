@@ -77,6 +77,14 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     ctx.ui.notify(`Loop every ${formatInterval(state.intervalMs)}: ${state.task}${pending}`, "info");
   };
 
+  /** Describe an interval, noting when scheduling rounded it to a cron cadence. */
+  const cadenceText = (requestedMs: number, effectiveMs: number): string => {
+    if (effectiveMs === requestedMs) {
+      return formatInterval(effectiveMs);
+    }
+    return `${formatInterval(effectiveMs)} (normalized from ${formatInterval(requestedMs)})`;
+  };
+
   pi.registerCommand("loop", {
     description: "Repeat a task at a fixed interval in this session",
     getArgumentCompletions: (prefix) => {
@@ -122,7 +130,8 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       }
 
       scheduler.start(intervalMs, command.task);
-      ctx.ui.notify(`Loop every ${formatInterval(intervalMs)}: ${command.task}`, "info");
+      const effectiveMs = scheduler.status().intervalMs;
+      ctx.ui.notify(`Loop every ${cadenceText(intervalMs, effectiveMs)}: ${command.task}`, "info");
     },
   });
 
