@@ -26,6 +26,12 @@ export interface ScheduledTask {
   /** The prompt to deliver when the task fires. */
   readonly prompt: string;
   readonly mode: TaskMode;
+  /**
+   * True for maintenance loops (bare or interval-only `/loop`). Their prompt is
+   * not fixed at creation: it is resolved fresh on every run, so an edited
+   * `.claude/loop.md` or `~/.claude/loop.md` takes effect on the next iteration.
+   */
+  readonly maintenance?: boolean;
   /** Creation time from the injected clock. */
   readonly createdAt: number;
   /**
@@ -48,6 +54,8 @@ export interface ScheduledTask {
 export interface NewTask {
   prompt: string;
   mode: TaskMode;
+  /** Mark a maintenance loop, whose prompt is re-resolved on every run. */
+  maintenance?: boolean;
   schedule?: FixedSchedule;
   nextFireAt?: number;
   reason?: string;
@@ -184,6 +192,7 @@ export class TaskRegistry {
       id: this.allocateId(),
       prompt: input.prompt,
       mode: input.mode,
+      ...(input.maintenance ? { maintenance: true } : {}),
       createdAt: this.now(),
       ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
       ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
@@ -251,6 +260,7 @@ export class TaskRegistry {
       id: current.id,
       prompt: update.prompt ?? current.prompt,
       mode: current.mode,
+      ...(current.maintenance ? { maintenance: true } : {}),
       createdAt: current.createdAt,
       pending: update.pending ?? current.pending,
       ...(schedule === undefined ? {} : { schedule }),

@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createLoopExtension, type LoopExtensionDeps } from "../src/index.ts";
-import { configReader, FakeCtx, FakePi, FakeTimers, missingFile, testRegistry } from "./helpers.ts";
+import { BUILT_IN_MAINTENANCE_PROMPT } from "../src/maintenance.ts";
+import {
+  configReader,
+  FakeCtx,
+  FakePi,
+  FakeTimers,
+  maintenanceReader,
+  missingFile,
+  testRegistry,
+} from "./helpers.ts";
 
 function setup(overrides: Partial<LoopExtensionDeps> = {}) {
+  const { maintenance, ...rest } = overrides;
   const timers = new FakeTimers();
   const pi = new FakePi();
   const ctx = new FakeCtx();
@@ -14,7 +24,15 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
     readFile: async () => {
       throw missingFile();
     },
-    ...overrides,
+    ...rest,
+    maintenance: {
+      cwd: "/tmp/pi-loop-project",
+      homeDir: "/tmp/pi-loop-home",
+      readFile: () => {
+        throw missingFile();
+      },
+      ...maintenance,
+    },
     registry,
   });
   return { timers, pi, ctx, registry };
@@ -193,19 +211,179 @@ test("a day interval is accepted and reported", async () => {
   assert.deepEqual(pi.sent, ["daily report"]);
 });
 
-test("maintenance forms warn and leave a running loop untouched", async () => {
+test("bare /loop starts a self-paced maintenance loop that sends the built-in prompt", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance loop \(self-paced\)/);
+  const [task] = registry.list();
+  assert.equal(task?.mode, "self-paced");
+  assert.equal(task?.maintenance, true, "the task is marked as a maintenance loop");
+
+  assert.deepEqual(pi.sent, [], "the first maintenance run is due immediately, not synchronously");
+  timers.advance(0);
+  assert.deepEqual(pi.sent, [BUILT_IN_MAINTENANCE_PROMPT]);
+});
+
+test("/loop <interval> starts a fixed maintenance loop on the cadence", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "5min", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance loop every 5min/);
+  const [task] = registry.list();
+  assert.equal(task?.mode, "fixed");
+  assert.equal(task?.maintenance, true);
+
+  assert.deepEqual(pi.sent, []);
+  timers.advance(299_999);
+  assert.deepEqual(pi.sent, [], "a fixed maintenance loop waits for the next boundary");
+  timers.advance(1);
+  assert.deepEqual(pi.sent, [BUILT_IN_MAINTENANCE_PROMPT]);
+});
+
+test("a project .claude/loop.md overrides the user file and the built-in prompt", async () => {
+  const files = maintenanceReader({
+    "/proj/.claude/loop.md": "project maintenance instructions",
+    "/home/me/.claude/loop.md": "user maintenance instructions",
+  });
+  const { timers, pi, ctx } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile: files.readFile },
+  });
+
+  await pi.run("loop", "5min", ctx);
+  timers.advance(300_000);
+  assert.deepEqual(pi.sent, ["project maintenance instructions"]);
+  assert.deepEqual(files.reads, ["/proj/.claude/loop.md"], "the project file wins before the user file is read");
+});
+
+test("the user loop.md applies when the project has none", async () => {
+  const files = maintenanceReader({ "/home/me/.claude/loop.md": "user maintenance instructions" });
+  const { timers, pi, ctx } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile: files.readFile },
+  });
+
+  await pi.run("loop", "5min", ctx);
+  timers.advance(300_000);
+  assert.deepEqual(pi.sent, ["user maintenance instructions"]);
+});
+
+test("an unreadable project loop.md is reported and never silently substituted", async () => {
+  const reads: string[] = [];
+  const readFile = (filePath: string): string => {
+    reads.push(filePath);
+    if (filePath === "/proj/.claude/loop.md") {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    }
+    return "user maintenance instructions";
+  };
+  const { timers, pi, ctx } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile },
+  });
+
+  await pi.run("loop", "5min", ctx);
+  timers.advance(300_000);
+
+  assert.equal(ctx.lastNotification()?.type, "error");
+  assert.match(
+    ctx.lastNotification()?.message ?? "",
+    /Maintenance prompt error: could not read \/proj\/\.claude\/loop\.md/,
+  );
+  assert.deepEqual(pi.sent, [], "the built-in and user prompts must not be substituted");
+  assert.deepEqual(reads, ["/proj/.claude/loop.md"], "an unreadable project file stops resolution");
+});
+
+test("an unreadable loop.md on a self-paced maintenance run falls back instead of stalling", async () => {
+  const readFile = (): string => {
+    throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+  };
+  const { timers, pi, ctx, registry } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile },
+  });
+
+  await pi.run("loop", "", ctx);
+  timers.advance(0);
+
+  assert.equal(ctx.lastNotification()?.type, "error");
+  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance prompt error/);
+  assert.deepEqual(pi.sent, [], "no prompt is sent when resolution fails");
+  assert.equal(registry.size, 1, "the loop stays active for the bounded retry");
+  assert.equal(timers.pendingCount, 1, "a fallback wakeup is armed so the loop cannot stall");
+});
+
+test("a custom prompt loop never reads loop.md", async () => {
+  const files = maintenanceReader({ "/proj/.claude/loop.md": "should not be used" });
+  const { timers, pi, ctx } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile: files.readFile },
+  });
+
+  await pi.run("loop", "every 1min custom task", ctx);
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["custom task"]);
+  assert.deepEqual(files.reads, [], "custom prompts are isolated from the maintenance files");
+
+  await pi.run("loop", "watch deploy", ctx);
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["custom task", "watch deploy"]);
+  assert.deepEqual(files.reads, [], "a self-paced custom prompt is isolated too");
+});
+
+test("edits to loop.md take effect on the next maintenance iteration", async () => {
+  let contents = "first maintenance instructions";
+  const readFile = (filePath: string): string => {
+    if (filePath === "/proj/.claude/loop.md") {
+      return contents;
+    }
+    throw missingFile();
+  };
+  const { timers, pi, ctx } = setup({
+    maintenance: { cwd: "/proj", homeDir: "/home/me", readFile },
+  });
+
+  await pi.run("loop", "1min", ctx);
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["first maintenance instructions"]);
+
+  contents = "second maintenance instructions";
+  timers.advance(60_000);
+  assert.deepEqual(
+    pi.sent,
+    ["first maintenance instructions", "second maintenance instructions"],
+    "the next run re-resolves the file without a restart",
+  );
+});
+
+test("a maintenance loop coalesces while busy and reports its status", async () => {
   const { timers, pi, ctx } = setup();
 
-  await pi.run("loop", "every 1min keepalive", ctx);
-  await pi.run("loop", "5min", ctx);
-  assert.equal(ctx.lastNotification()?.type, "warning");
-  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance/);
+  await pi.run("loop", "1min", ctx);
+  ctx.idle = false;
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, [], "a busy maintenance tick must not interrupt the agent");
 
   await pi.run("loop", "status", ctx);
-  assert.match(ctx.lastNotification()?.message ?? "", /every 1min: keepalive/);
+  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance loop every 1min/);
+  assert.match(ctx.lastNotification()?.message ?? "", /queued/);
 
+  ctx.idle = true;
+  pi.fire("agent_settled", ctx);
+  assert.deepEqual(pi.sent, [BUILT_IN_MAINTENANCE_PROMPT]);
+});
+
+test("a self-paced maintenance loop uses the bounded fallback and then terminates", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "", ctx);
+  timers.advance(0);
+  assert.deepEqual(pi.sent, [BUILT_IN_MAINTENANCE_PROMPT]);
+
+  pi.fire("agent_settled", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /fallback wakeup scheduled/);
   timers.advance(60_000);
-  assert.deepEqual(pi.sent, ["keepalive"]);
+  assert.deepEqual(pi.sent, [BUILT_IN_MAINTENANCE_PROMPT, BUILT_IN_MAINTENANCE_PROMPT]);
+
+  pi.fire("agent_settled", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /stopped after a repeated missing wakeup/);
+  assert.equal(registry.size, 0);
 });
 
 test("stop cancels the timer, drops pending work, and reports state", async () => {

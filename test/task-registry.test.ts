@@ -128,6 +128,20 @@ test("the registry stores a frozen copy of the schedule, not the caller's object
   assert.equal(Object.isFrozen(updated.schedule), true);
 });
 
+test("a maintenance marker is stored and preserved across updates", () => {
+  const { registry } = makeRegistry();
+  const task = registry.create({ prompt: "maintenance", mode: "fixed", maintenance: true });
+  assert.equal(task.maintenance, true);
+
+  const updated = registry.update(task.id, { pending: true, nextFireAt: 1_000 });
+  assert.equal(updated.maintenance, true, "update preserves the maintenance marker");
+  assert.equal(
+    registry.create({ prompt: "plain", mode: "fixed" }).maintenance,
+    undefined,
+    "ordinary tasks are not marked as maintenance",
+  );
+});
+
 test("a self-paced reason is stored on create and updated later", () => {
   const { registry } = makeRegistry();
   const created = registry.create({

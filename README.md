@@ -9,6 +9,8 @@ conversation while the session stays open.
 /loop check all tmux sessions and handle results
 /loop 30min check Things and report changes
 /loop check Things and report changes every 30min
+/loop
+/loop 15m
 /loop stop
 /loop status
 ```
@@ -35,10 +37,10 @@ conversation while the session stays open.
 - `/loop stop` cancels the loop and any queued run.
 - `/loop status` reports the active task, whether it is self-paced or fixed, the
   effective interval, and whether a run is queued or a wakeup is pending.
-- Bare `/loop` and interval-only `/loop <n><unit>` are recognized as
-  **maintenance** loops. The maintenance prompt lands in a later change, so for
-  now they report that maintenance mode is not yet available and leave any
-  running loop untouched.
+- Bare `/loop` and interval-only `/loop <n><unit>` are **maintenance** loops:
+  they run a maintenance prompt rather than one you type. Bare `/loop` is
+  self-paced; `/loop <n><unit>` runs on a fixed schedule. See
+  [Maintenance loops](#maintenance-loops).
 - Interval-looking input that cannot be parsed (for example `/loop 5x check`,
   `/loop 1h30min check`, or `/loop .5h check`) fails closed with a usage error.
   It never becomes task text and never disturbs an existing loop.
@@ -70,6 +72,42 @@ model-facing operations that call it are tracked separately.
 The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
 command, and Pi's usual tool permissions apply.
+
+## Maintenance loops
+
+A bare `/loop` (or interval-only `/loop <n><unit>`) runs a maintenance pass
+instead of a prompt you type. Bare `/loop` is **self-paced**; adding an interval
+makes it a **fixed** schedule, e.g. `/loop 15m`.
+
+Unlike a command-line task, the maintenance prompt is not fixed when the loop
+starts. **Every iteration resolves it fresh**, in this order:
+
+1. `.claude/loop.md` in the project directory (project override).
+2. `~/.claude/loop.md` (user default).
+3. The built-in maintenance prompt.
+
+The first readable, non-empty file wins, so a project override beats a user
+default. Because resolution happens on each run, **edits to a `loop.md` take
+effect on the next iteration** without restarting the loop. Passing a prompt on
+the command line (`/loop 5m <task>`) always bypasses these files.
+
+The file is plain Markdown with no required structure; write it as if you were
+typing the `/loop` prompt directly. Content is capped at **25,000 bytes**
+(UTF-8); anything longer is truncated to the cap without splitting a character.
+
+- **Missing files are normal.** When neither file exists, the built-in prompt
+  runs.
+- **Unreadable files are hard errors.** A `loop.md` that exists but cannot be
+  read, or is empty/whitespace-only, is reported as a `Maintenance prompt error`
+  and that iteration is skipped. The resolver never quietly falls back to the
+  other file or the built-in prompt.
+- **A skipped fixed run resumes on the next boundary.** A skipped self-paced run
+  has no iteration to choose a wakeup, so the same bounded fallback as a missed
+  self-paced choice applies (one fallback, then terminate on a repeat).
+
+The built-in prompt continues unfinished work from the conversation, tends to
+the current branch's pull request, and runs a cleanup pass when nothing else is
+pending, without starting unrelated work or taking irreversible actions.
 
 ## Requirements
 
@@ -103,8 +141,8 @@ declares the entry point:
 
 ## Configure the self-paced fallback delay
 
-Bare `/loop <task>` (no interval) reads the optional user-level config file
-`~/.pi/agent/loop.json`:
+Bare `/loop <task>` and bare `/loop` (both self-paced) read the optional
+user-level config file `~/.pi/agent/loop.json`:
 
 ```json
 { "defaultInterval": "5min" }
@@ -112,7 +150,8 @@ Bare `/loop <task>` (no interval) reads the optional user-level config file
 
 For self-paced loops the value is the **fallback wakeup delay**: how long the
 scheduler waits before retrying once when an iteration does not choose its next
-wakeup. Explicit interval loops ignore the file.
+wakeup. Explicit interval loops, including `/loop <n><unit>` maintenance loops,
+ignore the file.
 
 - Missing file → `1min`.
 - The configured value is clamped into the supported 1 minute–1 hour wakeup
@@ -191,14 +230,18 @@ The logic is split so it can be tested without Pi:
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps) and `nextFireAt` boundary calculation. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
-| `src/index.ts` | Pi wiring: command, idle events, and lifecycle cleanup. |
+| `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
+| `src/index.ts` | Pi wiring: command, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
 timers overdue), a deterministic registry factory, and a fake Pi API. Scheduler
 and adapter tests never sleep — they drive time explicitly and assert boundary
 alignment, normalization, coalescing, long busy periods, clock jumps,
 replacement, stop, dispatch errors, cleanup, and the self-paced reschedule,
-clamp, bounded-fallback, termination, and stale-callback paths.
+clamp, bounded-fallback, termination, and stale-callback paths. Maintenance
+coverage adds file lookup and precedence, missing/unreadable/empty files,
+byte-bounded truncation, custom-prompt isolation, dynamic reload, both command
+forms, and per-run prompt resolution on the scheduler.
 
 ### Live smoke test
 
@@ -228,9 +271,11 @@ stream shows `extension_ui_request` notifications for the loop and a
 - **`Self-paced loop stopped after a repeated missing wakeup.`** — two
   iterations in a row neither rescheduled nor stopped, so the loop was terminated
   instead of spinning. Start it again with `/loop` if needed.
-- **`Maintenance loops ... are not available yet.`** — bare `/loop` and
-  interval-only `/loop <n><unit>` are recognized, but the maintenance prompt is
-  a later change. Pass a task (for example `/loop 5min <task>`) to start a loop.
+- **`Maintenance prompt error: could not read ...`** — a `.claude/loop.md` or
+  `~/.claude/loop.md` exists but could not be read (or is empty). Fix or remove
+  the file; the iteration is skipped and the loop is not silently given a
+  different prompt. A fixed loop retries at the next boundary; a self-paced loop
+  uses its bounded fallback.
 - **`Loop config error: ...`** — `loop.json` is malformed, unreadable, or has an
   invalid `defaultInterval`. Fix the file or use an explicit interval.
 - **A task beginning with `stop`/`status` is treated as a command.** Only the

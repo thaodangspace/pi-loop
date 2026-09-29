@@ -11,13 +11,18 @@ import {
   clampWakeupDelay,
   formatInterval,
   LoopScheduler,
-  maintenanceText,
   parseLoopCommand,
   systemTimers,
   usageText,
   type SchedulerDeps,
 } from "./loop-core.ts";
-import { TaskRegistry } from "./task-registry.ts";
+import {
+  BUILT_IN_MAINTENANCE_PROMPT,
+  MaintenancePromptError,
+  resolveMaintenancePrompt,
+  type ResolveMaintenanceOptions,
+} from "./maintenance.ts";
+import { TaskRegistry, type ScheduledTask } from "./task-registry.ts";
 
 export interface LoopExtensionDeps {
   /** Override the `loop.json` path (tests or an explicit deploy). */
@@ -28,6 +33,8 @@ export interface LoopExtensionDeps {
   timers?: SchedulerDeps;
   /** Override the per-session task registry (tests, or an explicit session). */
   registry?: TaskRegistry;
+  /** Override maintenance prompt resolution: project/user paths and reader (tests). */
+  maintenance?: ResolveMaintenanceOptions;
 }
 
 function errorMessage(error: unknown): string {
@@ -57,15 +64,27 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     latestCtx?.ui.notify(message, type);
   };
 
+  // Maintenance loops resolve their prompt on every run, so an edited
+  // `.claude/loop.md` or `~/.claude/loop.md` takes effect on the next iteration.
+  const resolvePrompt = (task: ScheduledTask): string =>
+    task.maintenance ? resolveMaintenancePrompt(deps.maintenance).prompt : task.prompt;
+
   const scheduler = new LoopScheduler(
     timers,
     registry,
-    (task) => {
+    (_task, prompt) => {
       // A user message, never a shell command. Only sent while idle.
-      pi.sendUserMessage(task.prompt);
+      pi.sendUserMessage(prompt);
     },
     () => latestCtx?.isIdle() ?? true,
-    (error) => notify(`Loop task failed to send: ${errorMessage(error)}`, "error"),
+    (error) => {
+      if (error instanceof MaintenancePromptError) {
+        notify(`Maintenance prompt error: ${error.message}`, "error");
+        return;
+      }
+      notify(`Loop task failed to send: ${errorMessage(error)}`, "error");
+    },
+    resolvePrompt,
   );
 
   const describe = (ctx: ExtensionCommandContext): void => {
@@ -75,6 +94,16 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       return;
     }
     const pending = state.pending ? " (one run queued for the next idle moment)" : "";
+    if (state.maintenance) {
+      if (state.mode === "self-paced") {
+        const awaiting = state.awaitingDecision ? " (waiting for the next wakeup)" : "";
+        const reason = state.reason ? ` (last reason: ${state.reason})` : "";
+        ctx.ui.notify(`Maintenance loop (self-paced)${pending}${awaiting}${reason}`, "info");
+        return;
+      }
+      ctx.ui.notify(`Maintenance loop every ${formatInterval(state.intervalMs)}${pending}`, "info");
+      return;
+    }
     if (state.mode === "self-paced") {
       const awaiting = state.awaitingDecision ? " (waiting for the next wakeup)" : "";
       const reason = state.reason ? ` (last reason: ${state.reason})` : "";
@@ -90,6 +119,26 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       return formatInterval(effectiveMs);
     }
     return `${formatInterval(effectiveMs)} (normalized from ${formatInterval(requestedMs)})`;
+  };
+
+  /** Describe a self-paced fallback delay, noting when it was clamped. */
+  const fallbackText = (requestedMs: number): string => {
+    const clamped = clampWakeupDelay(requestedMs);
+    if (clamped === requestedMs) {
+      return formatInterval(clamped);
+    }
+    return `${formatInterval(clamped)} (normalized from ${formatInterval(requestedMs)})`;
+  };
+
+  /** Read the optional `loop.json` fallback delay for a self-paced loop. */
+  const readFallbackDelay = async (ctx: ExtensionCommandContext): Promise<number | undefined> => {
+    try {
+      const resolved = await loadDefaultInterval({ configPath, readFile: deps.readFile });
+      return resolved.intervalMs;
+    } catch (error) {
+      ctx.ui.notify(`Loop config error: ${errorMessage(error)}`, "error");
+      return undefined;
+    }
   };
 
   pi.registerCommand("loop", {
@@ -115,12 +164,35 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
         case "status":
           describe(ctx);
           return;
-        case "maintenance":
-          // Recognized so interval-looking input never becomes task text, but
-          // the maintenance prompt (loop.md) is a later change. Leave any
-          // existing loop untouched.
-          ctx.ui.notify(maintenanceText(command.intervalMs), "warning");
+        case "maintenance": {
+          // Bare `/loop` and interval-only `/loop <n><unit>` run the maintenance
+          // prompt. It is not fixed at start: the prompt is resolved fresh on
+          // every run from `.claude/loop.md`, then `~/.claude/loop.md`, then the
+          // built-in prompt, so a missing or unreadable file is reported at the
+          // first iteration rather than blocking the command.
+          if (command.intervalMs === undefined) {
+            const fallbackDelayMs = await readFallbackDelay(ctx);
+            if (fallbackDelayMs === undefined) {
+              return;
+            }
+            scheduler.startSelfPaced(BUILT_IN_MAINTENANCE_PROMPT, {
+              fallbackDelayMs,
+              maintenance: true,
+            });
+            ctx.ui.notify(
+              `Maintenance loop (self-paced): loop.md or the built-in prompt, resolved each run (fallback wakeup in ${fallbackText(fallbackDelayMs)} if no next wakeup is chosen).`,
+              "info",
+            );
+            return;
+          }
+          scheduler.start(command.intervalMs, BUILT_IN_MAINTENANCE_PROMPT, { maintenance: true });
+          const effectiveMs = scheduler.status().intervalMs;
+          ctx.ui.notify(
+            `Maintenance loop every ${cadenceText(command.intervalMs, effectiveMs)}: loop.md or the built-in prompt, resolved each run.`,
+            "info",
+          );
           return;
+        }
         case "start":
           break;
       }
@@ -129,22 +201,13 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
         // Prompt-only `/loop <task>` is self-paced: the iteration chooses its
         // next wakeup. The optional config interval becomes the bounded fallback
         // delay used when an iteration does not choose one.
-        let fallbackDelayMs: number;
-        try {
-          const resolved = await loadDefaultInterval({ configPath, readFile: deps.readFile });
-          fallbackDelayMs = resolved.intervalMs;
-        } catch (error) {
-          ctx.ui.notify(`Loop config error: ${errorMessage(error)}`, "error");
+        const fallbackDelayMs = await readFallbackDelay(ctx);
+        if (fallbackDelayMs === undefined) {
           return;
         }
         scheduler.startSelfPaced(command.task, { fallbackDelayMs });
-        const fallbackMs = clampWakeupDelay(fallbackDelayMs);
-        const fallbackText =
-          fallbackMs === fallbackDelayMs
-            ? formatInterval(fallbackMs)
-            : `${formatInterval(fallbackMs)} (normalized from ${formatInterval(fallbackDelayMs)})`;
         ctx.ui.notify(
-          `Self-paced loop: ${command.task} (fallback wakeup in ${fallbackText} if no next wakeup is chosen).`,
+          `Self-paced loop: ${command.task} (fallback wakeup in ${fallbackText(fallbackDelayMs)} if no next wakeup is chosen).`,
           "info",
         );
         return;

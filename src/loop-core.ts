@@ -217,8 +217,8 @@ function trailingInterval(args: string): TrailingInterval {
  * - `<interval> <prompt>` (Claude-style, e.g. `5m check deploy`)
  * - `<prompt> every <interval>`
  * - `<prompt>` (literal self-paced task)
- * - `<interval>` and bare `/loop` (maintenance loops; prompt wiring lands with
- *   the maintenance-mode work)
+ * - `<interval>` and bare `/loop` (maintenance loops: the built-in maintenance
+ *   prompt, or a per-iteration `loop.md`, on a fixed or self-paced schedule)
  * - `every <interval> <prompt>` (Pi compatibility alias)
  *
  * Precedence: `stop`/`status` are exact commands, then the `every` alias, then a
@@ -299,18 +299,12 @@ export function usageText(reason?: string): string {
     `/loop <n><unit> <task>                    fixed schedule (units: s, min, h, d)\n` +
     `/loop <task> every <n><unit>              set the fixed interval after the task\n` +
     `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
+    `/loop                                      maintenance: built-in prompt, self-paced\n` +
+    `/loop <n><unit>                           maintenance on a fixed schedule\n` +
     `/loop stop                                 cancel the active loop\n` +
     `/loop status                               show the active loop\n` +
+    `Maintenance loops use .claude/loop.md, then ~/.claude/loop.md, then the built-in prompt, resolved fresh each run.\n` +
     `Self-paced wakeup delays clamp to 1min-1h. Fixed intervals round to a cron cadence: seconds up to the next whole minute, and steps such as 7m or 90m to the nearest supported value.`
-  );
-}
-
-/** Guidance for bare/interval-only maintenance loops that are not wired up yet. */
-export function maintenanceText(intervalMs?: number): string {
-  const interval = intervalMs === undefined ? "5m" : formatInterval(intervalMs);
-  return (
-    `Maintenance loops (bare or interval-only /loop) are not available yet.\n` +
-    `Add a task to start a loop, e.g. /loop ${interval} <task>.`
   );
 }
 
@@ -319,6 +313,8 @@ export interface LoopStatus {
   active: boolean;
   /** Which mode the active task runs in. Absent when no task is active. */
   mode?: TaskMode;
+  /** True when the active loop is a maintenance loop whose prompt is resolved per run. */
+  maintenance?: boolean;
   /** Effective, normalized cadence in milliseconds; 0 for self-paced tasks. */
   intervalMs: number;
   task: string;
@@ -373,8 +369,14 @@ export interface WakeupDecision {
   reason?: string;
 }
 
+/** Options accepted when starting a fixed loop. */
+export interface StartOptions {
+  /** Mark a maintenance loop, whose prompt is re-resolved on every run. */
+  maintenance?: boolean;
+}
+
 /** Options accepted when starting a self-paced loop. */
-export interface SelfPacedStartOptions {
+export interface SelfPacedStartOptions extends StartOptions {
   /**
    * Delay used for the single bounded fallback wakeup when an iteration neither
    * reschedules nor stops. Clamped into [1 minute, 1 hour].
@@ -448,6 +450,14 @@ export const systemTimers: SchedulerDeps = {
  *   never replayed as a backlog.
  * - A generation counter makes callbacks from a replaced/stopped loop no-ops.
  * - `stop`/`dispose` are idempotent and leave no live timer.
+ *
+ * Prompt resolution:
+ * - The prompt for a run is produced by the injected `resolvePrompt` provider at
+ *   dispatch time, not read from the task record. Maintenance loops use this to
+ *   pick up an edited `loop.md` on the next run.
+ * - A provider that throws is reported through `onError`. A fixed run is skipped
+ *   and the schedule continues; a self-paced run has no iteration to choose the
+ *   next wakeup, so the bounded fallback policy applies instead of stalling.
  */
 export class LoopScheduler implements WakeupService {
   private timer: unknown = null;
@@ -465,12 +475,18 @@ export class LoopScheduler implements WakeupService {
   constructor(
     private readonly deps: SchedulerDeps,
     private readonly registry: TaskRegistry,
-    private readonly dispatch: (task: ScheduledTask) => void | Promise<void>,
+    private readonly dispatch: (task: ScheduledTask, prompt: string) => void | Promise<void>,
     private readonly isIdle: () => boolean,
     private readonly onError?: (error: unknown) => void,
+    /**
+     * Produce the prompt delivered for a run. Called once per dispatch, so a
+     * maintenance loop resolves `loop.md` afresh each iteration. Defaults to the
+     * task's stored prompt.
+     */
+    private readonly resolvePrompt: (task: ScheduledTask) => string = (task) => task.prompt,
   ) {}
 
-  start(intervalMs: number, task: string): void {
+  start(intervalMs: number, task: string, options: StartOptions = {}): void {
     if (this.disposed) {
       throw new Error("scheduler has been disposed");
     }
@@ -482,6 +498,7 @@ export class LoopScheduler implements WakeupService {
     const created = this.registry.create({
       prompt: task,
       mode: "fixed",
+      ...(options.maintenance ? { maintenance: true } : {}),
       schedule,
       nextFireAt: nextFireAt(schedule, this.deps.now()),
     });
@@ -509,6 +526,7 @@ export class LoopScheduler implements WakeupService {
     const created = this.registry.create({
       prompt,
       mode: "self-paced",
+      ...(options.maintenance ? { maintenance: true } : {}),
       nextFireAt: this.deps.now(),
     });
     this.taskId = created.id;
@@ -570,9 +588,16 @@ export class LoopScheduler implements WakeupService {
       return { action: "none" };
     }
     this.awaitingDecision = false;
-    // A second consecutive miss means the fallback iteration also failed to
-    // choose. Terminate instead of granting another fallback, so a broken loop
-    // can never spin forever.
+    return this.applyMissedChoice(task);
+  }
+
+  /**
+   * Apply the bounded fallback policy for an iteration that produced no next
+   * wakeup: grant one fallback wakeup, then terminate on a second consecutive
+   * miss so a broken loop can never spin forever. Also used when a maintenance
+   * prompt cannot be resolved and no iteration ran to choose a wakeup.
+   */
+  private applyMissedChoice(task: ScheduledTask): IterationSettleResult {
     if (this.fallbackUsed) {
       this.stop();
       return { action: "terminated" };
@@ -623,9 +648,7 @@ export class LoopScheduler implements WakeupService {
     if (task.mode === "self-paced") {
       return this.beginSelfPacedRun(this.generation, task);
     }
-    const updated = this.registry.update(task.id, { pending: false });
-    this.safeDispatch(updated, this.generation);
-    return true;
+    return this.deliverFixed(task, this.generation);
   }
 
   status(): LoopStatus {
@@ -637,6 +660,7 @@ export class LoopScheduler implements WakeupService {
       task: task?.prompt ?? "",
       pending: task?.pending ?? false,
       ...(task === undefined ? {} : { mode: task.mode }),
+      ...(task?.maintenance ? { maintenance: true } : {}),
       ...(selfPaced ? { awaitingDecision: this.awaitingDecision, fallbackUsed: this.fallbackUsed } : {}),
       ...(task?.reason === undefined ? {} : { reason: task.reason }),
       ...(this.schedule === undefined ? {} : { schedule: this.schedule }),
@@ -705,8 +729,7 @@ export class LoopScheduler implements WakeupService {
       return;
     }
     if (this.isIdle()) {
-      const updated = this.registry.update(task.id, { pending: false });
-      this.safeDispatch(updated, generation);
+      this.deliverFixed(task, generation);
     } else {
       this.registry.update(task.id, { pending: true });
     }
@@ -739,18 +762,51 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
+   * Deliver a due fixed run: resolve its prompt, clear the pending flag, and
+   * dispatch. Returns whether a dispatch was attempted.
+   *
+   * A prompt that cannot be resolved is reported and this run is skipped; the
+   * schedule has already advanced, so the next boundary retries without
+   * retaining a pending run or spamming retries.
+   */
+  private deliverFixed(task: ScheduledTask, generation: number): boolean {
+    const updated = this.registry.update(task.id, { pending: false });
+    let prompt: string;
+    try {
+      prompt = this.resolvePrompt(updated);
+    } catch (error) {
+      this.onError?.(error);
+      return false;
+    }
+    this.safeDispatch(updated, prompt, generation);
+    return true;
+  }
+
+  /**
    * Dispatch one self-paced run and mark the iteration as awaiting a choice.
    * Returns false (and leaves the run pending for retry) when delivery throws.
    *
    * The awaiting flag is set *before* dispatch so a dispatch that synchronously
    * reschedules (which clears the flag and arms the next timer) is not
    * overwritten afterwards.
+   *
+   * If the prompt cannot be resolved, no iteration runs and therefore no next
+   * wakeup can be chosen; the bounded fallback policy applies so a resolution
+   * failure cannot stall the loop.
    */
   private beginSelfPacedRun(generation: number, task: ScheduledTask): boolean {
+    let prompt: string;
+    try {
+      prompt = this.resolvePrompt(task);
+    } catch (error) {
+      this.onError?.(error);
+      const settled = this.applyMissedChoice(task);
+      return settled.action === "fallback";
+    }
     const updated = this.registry.update(task.id, { pending: false });
     this.runToken += 1;
     this.awaitingDecision = true;
-    const delivered = this.safeDispatch(updated, generation, this.runToken);
+    const delivered = this.safeDispatch(updated, prompt, generation, this.runToken);
     // A synchronous dispatch error clears the flag in onDispatchError; a
     // replacement/stop during dispatch owns the flag already, so leave it.
     if (delivered && generation === this.generation && this.currentTask()?.id === task.id) {
@@ -759,10 +815,10 @@ export class LoopScheduler implements WakeupService {
     return false;
   }
 
-  /** Dispatch a task snapshot. Returns false when delivery throws synchronously. */
-  private safeDispatch(task: ScheduledTask, generation: number, token?: number): boolean {
+  /** Dispatch a task snapshot and its resolved prompt. Returns false on a synchronous throw. */
+  private safeDispatch(task: ScheduledTask, prompt: string, generation: number, token?: number): boolean {
     try {
-      const result = this.dispatch(task);
+      const result = this.dispatch(task, prompt);
       if (result && typeof (result as Promise<void>).then === "function") {
         void (result as Promise<void>).catch((error) => {
           this.onDispatchError(error, generation, token);
