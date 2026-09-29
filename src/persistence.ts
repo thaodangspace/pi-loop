@@ -13,7 +13,7 @@
  * contains an entry the reader cannot interpret fails closed, so an unknown
  * tombstone can never be bypassed by restoring the readable entries around it.
  */
-import type { FixedSchedule } from "./schedule.ts";
+import { defaultExpiresAt, type FixedSchedule } from "./schedule.ts";
 import type { TaskMode } from "./task-registry.ts";
 
 /**
@@ -45,7 +45,11 @@ export interface PersistedTask {
    * scheduler recomputes the next boundary from the schedule on restore.
    */
   nextFireAt?: number;
-  /** Optional absolute time after which the task must not be restored or run. */
+  /**
+   * Absolute time after which the task must not be restored or run. Recurring
+   * fixed tasks created by the scheduler default to `createdAt + 7 days`;
+   * replay also applies that default when an older entry omitted it.
+   */
   expiresAt?: number;
 }
 
@@ -292,7 +296,10 @@ function decideRestoration(task: PersistedTask, now: number): Restoration {
   if (task.mode === "one-shot" && task.nextFireAt === undefined) {
     return { restore: false, issue: `ignored persisted one-shot task ${task.id} with no next fire time` };
   }
-  if (task.expiresAt !== undefined && task.expiresAt <= now) {
+  // Recurring fixed tasks default to a seven-day lifetime from their original
+  // creation time, including tasks persisted before the default existed.
+  const expiresAt = task.expiresAt ?? (task.mode === "fixed" ? defaultExpiresAt(task.createdAt) : undefined);
+  if (expiresAt !== undefined && expiresAt <= now) {
     // Expired: intentionally dropped without an error notification.
     return { restore: false };
   }

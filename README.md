@@ -224,8 +224,27 @@ ignore the file.
 - **Absolute boundaries, no drift.** Fire times are fixed schedule boundaries
   (`anchor + k × cadence`, anchored on the Unix epoch by default), not
   `now + interval`. A late timer, a long agent turn, or a clock jump never
-  shifts later boundaries. The first run is at the next boundary, so a `5min`
-  loop started at 12:03 first runs at 12:05.
+  shifts later boundaries. The first run is at the next boundary plus the task's
+  small ID-derived phase, so a `5min` loop started at 12:03 first runs at 12:05
+  plus at most 75 seconds.
+- **Deterministic per-task jitter.** Each recurring fixed task also carries a
+  stable phase offset derived from its ID (a documented FNV-1a hash) and bounded
+  to a fraction of its cadence: a quarter of the cadence, capped at one hour.
+  A 1-minute task is spread over 15 seconds, a 5-minute task over 75 seconds,
+  and an hourly task over 15 minutes, so many same-interval tasks do not all
+  fire on the same instant. The offset is fixed for the task's life (no drift)
+  and recomputed from the same ID, schedule, and anchor on restore, so a reload
+  does not move a boundary. One-shot and self-paced tasks are never jittered.
+- **Recurring fixed tasks expire after seven days.** By default a recurring
+  fixed task gets `expiresAt = createdAt + 7 days`; an explicit expiry overrides
+  (and may shorten or lengthen) it. A boundary exactly at the expiry still runs
+  when Pi is idle, but any later run is dropped: if the expiry lands while Pi is
+  busy, the task (and its queued run) is removed rather than delivered late. An
+  expired task is removed from the registry, its timer, the due queue, and
+  persisted state (a delete tombstone), and an expired persisted task is not
+  restored. A cadence longer than seven days never reaches its first boundary
+  under the default, so pass an explicit `expiresAt` that covers the first run if
+  you need one.
 - **One command loop per session.** Creating a new loop with `/loop` replaces the
   old one and cancels its timer. Behind the command, the scheduler tracks that
   command-owned loop as a `fixed` or `self-paced` task in a per-session task
@@ -289,10 +308,10 @@ The logic is split so it can be tested without Pi:
 
 | Module | Responsibility |
 |---|---|
-| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, injected clock and dispatch). |
+| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, ID-based jitter, seven-day default expiry, injected clock and dispatch). |
 | `src/due-queue.ts` | Scheduler-owned per-task due queue: coalesces repeated misses and defines the deterministic flush order (earliest missed deadline, ties by registration). |
-| `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps) and `nextFireAt` boundary calculation. |
-| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, optional expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
+| `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps), `nextFireAt` boundary calculation, the FNV-1a ID hash with bounded jitter offsets, and the default seven-day task lifetime. |
+| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
@@ -303,13 +322,19 @@ The logic is split so it can be tested without Pi:
 timers overdue), a deterministic registry factory, and a fake Pi API whose
 `sendUserMessage` reproduces Pi's expansion semantics (a matching extension
 command executes; skills and templates expand; otherwise the text is literal).
-Scheduler and adapter tests never sleep — they drive time explicitly and assert
-boundary alignment, normalization, coalescing, long busy periods, clock jumps,
-replacement, stop, dispatch errors, cleanup, and the self-paced reschedule,
-clamp, bounded-fallback, termination, and stale-callback paths. Due-queue
-coverage adds per-task coalescing, deterministic flush order for two distinct
-tasks and simultaneous deadlines, long busy windows, deleted/stopped tasks and
-stale callbacks, and flush reentrancy when a dispatch starts work. Maintenance
+The virtual clock disables task-ID jitter by default so boundary/grid suites
+assert the underlying schedule; jitter suites override `jitterOffset` with the
+real hash. Scheduler and adapter tests never sleep — they drive time explicitly
+and assert boundary alignment, normalization, coalescing, long busy periods,
+clock jumps, replacement, stop, dispatch errors, cleanup, and the self-paced
+reschedule, clamp, bounded-fallback, termination, and stale-callback paths.
+Due-queue coverage adds per-task coalescing, deterministic flush order for two
+distinct tasks and simultaneous deadlines, long busy windows, deleted/stopped
+tasks and stale callbacks, and flush reentrancy when a dispatch starts work.
+Expiry/jitter coverage adds hash stability and offset bounds, distinct-ID
+phases, drift-free jittered boundaries, restore phase reproduction, the
+seven-day default lifetime, the inclusive expiry boundary, delayed and busy
+expiry, flush-time expiry, and restore near and after expiry. Maintenance
 coverage adds file lookup and precedence, missing/unreadable/empty files,
 byte-bounded truncation, custom-prompt isolation, dynamic reload, both command
 forms, and per-run prompt resolution on the scheduler. Dispatch coverage adds
@@ -373,3 +398,7 @@ stream shows `extension_ui_request` notifications for the loop and a
   wakeup state is ephemeral. Fixed loops and one-shot tasks are rebuilt from the
   session with the same ID, unless they were stopped, expired, or missed (a
   one-shot).
+- **A fixed loop stopped on its own after about a week.** Recurring fixed tasks
+  expire seven days after creation by default. Start a fresh `/loop` for a new
+  lifetime, or schedule the task with an explicit `expiresAt` through the
+  scheduler API if you need a different bound.
