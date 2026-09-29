@@ -21,6 +21,45 @@ test("implicit tasks keep literal text and request the default interval", () => 
   });
 });
 
+test("Claude-style leading interval keeps the schedule out of the task", () => {
+  assert.deepEqual(parseLoopCommand("5m check deploy"), {
+    type: "start",
+    intervalMs: 300_000,
+    task: "check deploy",
+  });
+  assert.deepEqual(parseLoopCommand("5 min check deploy"), {
+    type: "start",
+    intervalMs: 300_000,
+    task: "check deploy",
+  });
+  assert.deepEqual(parseLoopCommand("1h reset the queue"), {
+    type: "start",
+    intervalMs: 3_600_000,
+    task: "reset the queue",
+  });
+});
+
+test("Claude-style trailing interval parses after the prompt", () => {
+  assert.deepEqual(parseLoopCommand("check deploy every 5m"), {
+    type: "start",
+    intervalMs: 300_000,
+    task: "check deploy",
+  });
+  assert.deepEqual(parseLoopCommand("check Things every 30 min"), {
+    type: "start",
+    intervalMs: 1_800_000,
+    task: "check Things",
+  });
+});
+
+test("bare and interval-only forms are recognized as maintenance loops", () => {
+  assert.deepEqual(parseLoopCommand(""), { type: "maintenance" });
+  assert.deepEqual(parseLoopCommand("   "), { type: "maintenance" });
+  assert.deepEqual(parseLoopCommand("5m"), { type: "maintenance", intervalMs: 300_000 });
+  assert.deepEqual(parseLoopCommand("5 min"), { type: "maintenance", intervalMs: 300_000 });
+  assert.deepEqual(parseLoopCommand("every 5m"), { type: "maintenance", intervalMs: 300_000 });
+});
+
 test("explicit intervals parse glued and spaced forms", () => {
   assert.deepEqual(parseLoopCommand("every 30min check Things and report changes"), {
     type: "start",
@@ -57,15 +96,28 @@ test("invalid intervals are rejected", () => {
 });
 
 test("malformed /loop commands return usage without a task", () => {
-  assert.equal(parseLoopCommand("").type, "usage");
-  assert.equal(parseLoopCommand("   ").type, "usage");
   const noEvery = parseLoopCommand("every");
   assert.deepEqual(noEvery, { type: "usage", reason: "missing interval after every" });
-  const badInterval = parseLoopCommand("every 0s ping");
-  assert.equal(badInterval.type, "usage");
-  const noTask = parseLoopCommand("every 5min");
-  assert.deepEqual(noTask, { type: "usage", reason: "missing task" });
+  assert.equal(parseLoopCommand("every 0s ping").type, "usage");
   assert.equal(parseLoopCommand("every abc ping").type, "usage");
+});
+
+test("interval-looking malformed input fails closed instead of becoming a task", () => {
+  for (const bad of ["5x ping", "5 ping", "0s ping", "-5m ping", "1h30min ping"]) {
+    assert.equal(parseLoopCommand(bad).type, "usage", `expected ${JSON.stringify(bad)} to fail closed`);
+  }
+  assert.equal(parseLoopCommand("5").type, "usage");
+  assert.equal(parseLoopCommand("every 5x ping").type, "usage");
+  assert.equal(parseLoopCommand("check deploy every 5x").type, "usage");
+  assert.equal(parseLoopCommand("check deploy every").type, "usage");
+  assert.equal(parseLoopCommand("check deploy every 5").type, "usage");
+});
+
+test("a non-numeric every clause stays a literal task", () => {
+  assert.deepEqual(parseLoopCommand("review every file in src"), {
+    type: "start",
+    task: "review every file in src",
+  });
 });
 
 test("stop and status are exact commands; otherwise text stays a task", () => {

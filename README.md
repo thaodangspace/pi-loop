@@ -6,7 +6,8 @@ and reporting in the conversation while the session stays open.
 
 ```
 /loop check all tmux sessions and handle results
-/loop every 30min check Things and report changes
+/loop 30min check Things and report changes
+/loop check Things and report changes every 30min
 /loop stop
 /loop status
 ```
@@ -14,11 +15,23 @@ and reporting in the conversation while the session stays open.
 ## What it does
 
 - `/loop <task>` repeats `<task>` at the configured default interval (1min).
-- `/loop every <n><unit> <task>` uses an explicit interval. Units: `s`, `min`,
-  `h` (singular, plural, and abbreviated spellings are accepted, e.g. `30min`,
-  `90s`, `2 hours`).
+- `/loop <n><unit> <task>` uses an explicit interval (Claude-style), e.g.
+  `/loop 5m check deploy`.
+- `/loop <task> every <n><unit>` uses an explicit interval written after the
+  task, e.g. `/loop check deploy every 5m`.
+- `/loop every <n><unit> <task>` is a Pi-compatible alias for the above.
+- Units `s`, `min`, and `h` are accepted, along with singular, plural, and
+  abbreviated spellings and a spaced unit, e.g. `30min`, `90s`, `2 hours`,
+  `30 min`.
 - `/loop stop` cancels the loop and any queued run.
 - `/loop status` reports the active task, interval, and whether a run is queued.
+- Bare `/loop` and interval-only `/loop <n><unit>` are recognized as
+  **maintenance** loops. The maintenance prompt and self-paced behavior land in
+  a later change, so for now they report that maintenance mode is not yet
+  available and leave any running loop untouched.
+- Interval-looking input that cannot be parsed (for example `/loop 5x check`
+  or `/loop 1h30min check`) fails closed with a usage error. It never becomes
+  task text and never disturbs an existing loop.
 
 The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
@@ -133,8 +146,13 @@ stream shows `extension_ui_request` notifications for the loop and a
 
 ## Troubleshooting
 
-- **`Usage error: ...`** — the command was incomplete. `/loop` needs a task;
-  `/loop every` needs `<n><unit>` and a task.
+- **`Usage error: ...`** — the command was incomplete or an interval could not
+  be parsed. Add a task, or fix the interval (for example `/loop every <n><unit>
+  <task>` needs both an interval and a task). Malformed interval-looking input
+  never becomes a task and never disturbs an existing loop.
+- **`Maintenance loops ... are not available yet.`** — bare `/loop` and
+  interval-only `/loop <n><unit>` are recognized, but the maintenance prompt is
+  a later change. Pass a task (for example `/loop 5m <task>`) to start a loop.
 - **`Loop config error: ...`** — `loop.json` is malformed, unreadable, or has an
   invalid `defaultInterval`. Fix the file or use an explicit interval.
 - **A task beginning with `stop`/`status` is treated as a command.** Only the

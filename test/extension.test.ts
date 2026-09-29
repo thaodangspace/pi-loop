@@ -72,9 +72,60 @@ test("usage errors leave a running loop untouched", async () => {
   const { timers, pi, ctx } = setup();
 
   await pi.run("loop", "every 1s keepalive", ctx);
-  await pi.run("loop", "", ctx);
+  await pi.run("loop", "5x keepalive", ctx);
   assert.equal(ctx.lastNotification()?.type, "warning");
   assert.match(ctx.lastNotification()?.message ?? "", /Usage error/);
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /every 1s: keepalive/);
+
+  timers.advance(1_000);
+  assert.deepEqual(pi.sent, ["keepalive"]);
+});
+
+test("malformed interval syntax leaves existing scheduled work unchanged", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "every 1s keepalive", ctx);
+  await pi.run("loop", "10min check deploy", ctx); // valid: replaces the loop
+  assert.match(ctx.lastNotification()?.message ?? "", /every 10min: check deploy/);
+
+  await pi.run("loop", "5x check deploy", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Usage error/);
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /every 10min: check deploy/);
+
+  timers.advance(600_000);
+  assert.deepEqual(pi.sent, ["check deploy"]);
+});
+
+test("Claude-style interval before the task starts a fixed loop", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "5s check deploy", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /every 5s: check deploy/);
+  assert.deepEqual(pi.sent, [], "the first run must not be immediate");
+  timers.advance(5_000);
+  assert.deepEqual(pi.sent, ["check deploy"]);
+});
+
+test("a trailing every clause sets the interval", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "check deploy every 5s", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /every 5s: check deploy/);
+  timers.advance(5_000);
+  assert.deepEqual(pi.sent, ["check deploy"]);
+});
+
+test("maintenance forms warn and leave a running loop untouched", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "every 1s keepalive", ctx);
+  await pi.run("loop", "5min", ctx);
+  assert.equal(ctx.lastNotification()?.type, "warning");
+  assert.match(ctx.lastNotification()?.message ?? "", /Maintenance/);
 
   await pi.run("loop", "status", ctx);
   assert.match(ctx.lastNotification()?.message ?? "", /every 1s: keepalive/);
