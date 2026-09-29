@@ -2,7 +2,11 @@
  * Pure, Pi-independent loop primitives: command parsing and the interval
  * scheduler. Nothing in this file imports the Pi runtime, so it can be tested
  * with deterministic fake timers.
+ *
+ * The scheduler keeps no task state of its own; the authoritative task record
+ * lives in a {@link TaskRegistry}, one per session.
  */
+import type { ScheduledTask, TaskRegistry } from "./task-registry.ts";
 
 /** Minimum accepted interval. Keeps the scheduler from creating a tight timer. */
 export const MIN_INTERVAL_MS = 1_000;
@@ -300,17 +304,25 @@ export interface LoopStatus {
 
 /** Injected timer primitives so tests can drive time deterministically. */
 export interface SchedulerDeps {
+  /** Current time in milliseconds, used to stamp task creation and next-fire times. */
+  now(): number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
 }
 
 export const systemTimers: SchedulerDeps = {
+  now: () => Date.now(),
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
 /**
  * One interval loop scoped to a single session.
+ *
+ * The scheduler holds only schedule configuration (the interval and the active
+ * task's ID). The task record itself lives in the shared {@link TaskRegistry},
+ * so the active loop is represented through the registry and time-stamped with
+ * the injected clock.
  *
  * Design guarantees:
  * - The first tick fires one full interval after `start`, never immediately.
@@ -321,15 +333,14 @@ export const systemTimers: SchedulerDeps = {
 export class LoopScheduler {
   private timer: unknown = null;
   private generation = 0;
-  private active = false;
   private disposed = false;
-  private pending = false;
   private intervalMs = 0;
-  private task = "";
+  private taskId: string | undefined;
 
   constructor(
     private readonly deps: SchedulerDeps,
-    private readonly dispatch: (task: string) => void | Promise<void>,
+    private readonly registry: TaskRegistry,
+    private readonly dispatch: (task: ScheduledTask) => void | Promise<void>,
     private readonly isIdle: () => boolean,
     private readonly onError?: (error: unknown) => void,
   ) {}
@@ -342,23 +353,27 @@ export class LoopScheduler {
       throw new Error("task must not be empty");
     }
     this.stop();
+    const created = this.registry.create({
+      prompt: task,
+      mode: "fixed",
+      nextFireAt: this.deps.now() + intervalMs,
+    });
+    this.taskId = created.id;
     this.intervalMs = intervalMs;
-    this.task = task;
-    this.active = true;
-    this.pending = false;
     this.schedule(this.generation);
   }
 
   /** Cancel the active loop. Returns whether a loop was running. Idempotent. */
   stop(): boolean {
-    const wasActive = this.active;
+    const active = this.currentTask() !== undefined;
     this.generation += 1;
     this.clear();
-    this.active = false;
-    this.pending = false;
+    if (this.taskId !== undefined) {
+      this.registry.delete(this.taskId);
+    }
+    this.taskId = undefined;
     this.intervalMs = 0;
-    this.task = "";
-    return wasActive;
+    return active;
   }
 
   /** Permanently disable the scheduler and drop any timer. Idempotent. */
@@ -372,27 +387,36 @@ export class LoopScheduler {
    * happened. Safe to call on every idle signal; a no-op otherwise.
    */
   flush(): boolean {
-    if (this.disposed || !this.active || !this.pending) {
+    if (this.disposed) {
       return false;
     }
-    if (!this.isIdle()) {
+    const task = this.currentTask();
+    if (!task || !task.pending || !this.isIdle()) {
       return false;
     }
-    this.pending = false;
-    this.safeDispatch();
+    this.registry.update(task.id, { pending: false });
+    this.safeDispatch(task);
     return true;
   }
 
   status(): LoopStatus {
+    const task = this.currentTask();
     return {
-      active: this.active,
+      active: task !== undefined,
       intervalMs: this.intervalMs,
-      task: this.task,
-      pending: this.pending,
+      task: task?.prompt ?? "",
+      pending: task?.pending ?? false,
     };
   }
 
+  private currentTask(): ScheduledTask | undefined {
+    return this.taskId === undefined ? undefined : this.registry.get(this.taskId);
+  }
+
   private schedule(generation: number): void {
+    if (this.taskId !== undefined) {
+      this.registry.update(this.taskId, { nextFireAt: this.deps.now() + this.intervalMs });
+    }
     this.timer = this.deps.setTimer(() => {
       this.timer = null;
       this.onTick(generation);
@@ -400,25 +424,29 @@ export class LoopScheduler {
   }
 
   private onTick(generation: number): void {
-    if (generation !== this.generation || !this.active) {
+    if (generation !== this.generation) {
+      return;
+    }
+    const task = this.currentTask();
+    if (!task) {
       return;
     }
     if (this.isIdle()) {
-      this.pending = false;
-      this.safeDispatch();
+      this.registry.update(task.id, { pending: false });
+      this.safeDispatch(task);
     } else {
-      this.pending = true;
+      this.registry.update(task.id, { pending: true });
     }
     // Dispatch may have stopped or replaced the loop; do not re-arm then.
-    if (generation !== this.generation || !this.active) {
+    if (generation !== this.generation || !this.currentTask()) {
       return;
     }
     this.schedule(generation);
   }
 
-  private safeDispatch(): void {
+  private safeDispatch(task: ScheduledTask): void {
     try {
-      const result = this.dispatch(this.task);
+      const result = this.dispatch(task);
       if (result && typeof (result as Promise<void>).then === "function") {
         void (result as Promise<void>).catch((error) => {
           this.onDispatchError(error);
@@ -432,8 +460,9 @@ export class LoopScheduler {
   private onDispatchError(error: unknown): void {
     // Retain at most one pending run and retry only at the next tick or idle
     // signal, so a failing dispatch can never spin.
-    if (this.active && !this.pending) {
-      this.pending = true;
+    const task = this.currentTask();
+    if (task && !task.pending) {
+      this.registry.update(task.id, { pending: true });
     }
     this.onError?.(error);
   }

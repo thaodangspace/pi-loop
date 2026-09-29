@@ -16,6 +16,7 @@ import {
   usageText,
   type SchedulerDeps,
 } from "./loop-core.ts";
+import { TaskRegistry } from "./task-registry.ts";
 
 export interface LoopExtensionDeps {
   /** Override the `loop.json` path (tests or an explicit deploy). */
@@ -24,6 +25,8 @@ export interface LoopExtensionDeps {
   readFile?: ConfigReader;
   /** Override timer primitives (tests). */
   timers?: SchedulerDeps;
+  /** Override the per-session task registry (tests, or an explicit session). */
+  registry?: TaskRegistry;
 }
 
 function errorMessage(error: unknown): string {
@@ -40,6 +43,10 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   const timers = deps.timers ?? systemTimers;
   const configPath = deps.configPath ?? loopConfigPath();
 
+  // One registry per extension instance, so sessions never share task state.
+  // Constructing it creates no timers or other resources.
+  const registry = deps.registry ?? new TaskRegistry({ now: () => timers.now() });
+
   // Latest context is only used for notifications and the authoritative idle
   // check; it is dropped on session shutdown so a replaced session's context is
   // never reused.
@@ -51,9 +58,10 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   const scheduler = new LoopScheduler(
     timers,
+    registry,
     (task) => {
       // A user message, never a shell command. Only sent while idle.
-      pi.sendUserMessage(task);
+      pi.sendUserMessage(task.prompt);
     },
     () => latestCtx?.isIdle() ?? true,
     (error) => notify(`Loop task failed to send: ${errorMessage(error)}`, "error"),
@@ -135,6 +143,8 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   pi.on("session_shutdown", () => {
     scheduler.stop();
+    // Drop every task so a reused instance cannot leak state into another session.
+    registry.clear();
     latestCtx = undefined;
   });
 }

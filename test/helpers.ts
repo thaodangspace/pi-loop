@@ -5,6 +5,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ConfigReader } from "../src/config.ts";
 import type { SchedulerDeps } from "../src/loop-core.ts";
+import { TaskRegistry } from "../src/task-registry.ts";
 
 interface FakeTimerTask {
   at: number;
@@ -13,13 +14,15 @@ interface FakeTimerTask {
 
 /** Virtual clock + timer queue implementing the scheduler's timer deps. */
 export class FakeTimers implements SchedulerDeps {
-  now = 0;
+  clock = 0;
   private nextId = 1;
   private readonly tasks = new Map<number, FakeTimerTask>();
 
+  now = (): number => this.clock;
+
   setTimer = (fn: () => void, ms: number): number => {
     const id = this.nextId++;
-    this.tasks.set(id, { at: this.now + ms, fn });
+    this.tasks.set(id, { at: this.clock + ms, fn });
     return id;
   };
 
@@ -33,7 +36,7 @@ export class FakeTimers implements SchedulerDeps {
 
   /** Advance the clock, firing every due timer in timestamp order. */
   advance(ms: number): void {
-    const target = this.now + ms;
+    const target = this.clock + ms;
     let steps = 0;
     for (;;) {
       let nextId: number | undefined;
@@ -49,14 +52,24 @@ export class FakeTimers implements SchedulerDeps {
       }
       const task = this.tasks.get(nextId)!;
       this.tasks.delete(nextId);
-      this.now = task.at;
+      this.clock = task.at;
       task.fn();
       if (++steps > 10_000) {
         throw new Error("fake timer runaway");
       }
     }
-    this.now = target;
+    this.clock = target;
   }
+}
+
+/** A registry wired to a fake clock with predictable `t1`, `t2`, ... IDs. */
+export function testRegistry(timers: FakeTimers, options: Partial<{ maxTasks: number }> = {}): TaskRegistry {
+  let counter = 0;
+  return new TaskRegistry({
+    now: () => timers.clock,
+    createId: () => `t${(counter += 1)}`,
+    ...options,
+  });
 }
 
 export interface FakeNotification {

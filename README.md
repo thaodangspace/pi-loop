@@ -90,7 +90,9 @@ Bare `/loop <task>` (no `every`) reads the optional user-level config file
 - **First run is delayed.** A loop's first run happens one full interval after
   the command, never immediately.
 - **One loop per session.** Creating a new loop replaces the old one and cancels
-  its timer.
+  its timer. Behind the command, the active loop is stored as a single `fixed`
+  task in a per-session task registry with a stable ID, which later changes
+  build on for multiple concurrent, self-paced, and persisted tasks.
 - **Busy ticks coalesce.** If Pi is busy when a run is due, missed ticks collapse
   into a single pending run delivered once Pi is idle again. Pi is never
   interrupted and no backlog accumulates.
@@ -124,12 +126,14 @@ The logic is split so it can be tested without Pi:
 | Module | Responsibility |
 |---|---|
 | `src/loop-core.ts` | Command parsing, interval validation, and the timer/idle scheduler (injected clock and dispatch). |
+| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/index.ts` | Pi wiring: command, idle events, and lifecycle cleanup. |
 
-`test/helpers.ts` provides a virtual clock and a fake Pi API. Scheduler and
-adapter tests never sleep — they drive time explicitly and assert coalescing,
-replacement, stop, dispatch errors, and cleanup.
+`test/helpers.ts` provides a virtual clock, a deterministic registry factory,
+and a fake Pi API. Scheduler and adapter tests never sleep — they drive time
+explicitly and assert coalescing, replacement, stop, dispatch errors, and
+cleanup.
 
 ### Live smoke test
 
