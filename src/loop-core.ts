@@ -394,8 +394,8 @@ export class LoopScheduler {
     if (!task || !task.pending || !this.isIdle()) {
       return false;
     }
-    this.registry.update(task.id, { pending: false });
-    this.safeDispatch(task);
+    const updated = this.registry.update(task.id, { pending: false });
+    this.safeDispatch(updated, this.generation);
     return true;
   }
 
@@ -432,8 +432,8 @@ export class LoopScheduler {
       return;
     }
     if (this.isIdle()) {
-      this.registry.update(task.id, { pending: false });
-      this.safeDispatch(task);
+      const updated = this.registry.update(task.id, { pending: false });
+      this.safeDispatch(updated, generation);
     } else {
       this.registry.update(task.id, { pending: true });
     }
@@ -444,25 +444,29 @@ export class LoopScheduler {
     this.schedule(generation);
   }
 
-  private safeDispatch(task: ScheduledTask): void {
+  private safeDispatch(task: ScheduledTask, generation: number): void {
     try {
       const result = this.dispatch(task);
       if (result && typeof (result as Promise<void>).then === "function") {
         void (result as Promise<void>).catch((error) => {
-          this.onDispatchError(error);
+          this.onDispatchError(error, generation);
         });
       }
     } catch (error) {
-      this.onDispatchError(error);
+      this.onDispatchError(error, generation);
     }
   }
 
-  private onDispatchError(error: unknown): void {
+  private onDispatchError(error: unknown, generation: number): void {
     // Retain at most one pending run and retry only at the next tick or idle
-    // signal, so a failing dispatch can never spin.
-    const task = this.currentTask();
-    if (task && !task.pending) {
-      this.registry.update(task.id, { pending: true });
+    // signal, so a failing dispatch can never spin. A rejection from a task
+    // that has since been stopped or replaced must not requeue its successor,
+    // so requeue only when the failing dispatch's generation is still current.
+    if (generation === this.generation) {
+      const task = this.currentTask();
+      if (task && !task.pending) {
+        this.registry.update(task.id, { pending: true });
+      }
     }
     this.onError?.(error);
   }

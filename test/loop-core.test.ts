@@ -349,5 +349,61 @@ test("a registry-backed dispatch receives the full task record", () => {
   assert.equal(received[0]!.id, "t1");
   assert.equal(received[0]!.prompt, "ping");
   assert.equal(received[0]!.mode, "fixed");
+  assert.equal(received[0]!.pending, false, "the snapshot matches the authoritative registry");
 });
+
+test("flush dispatches the snapshot with pending already cleared", () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const received: ScheduledTask[] = [];
+  let idle = false;
+  const scheduler = new LoopScheduler(timers, registry, (task) => {
+      received.push(task);
+    }, () => idle);
+
+  scheduler.start(1_000, "ping");
+  timers.advance(1_000);
+  assert.equal(registry.list()[0]!.pending, true, "a busy tick is queued");
+
+  idle = true;
+  assert.equal(scheduler.flush(), true);
+  assert.equal(received[0]!.pending, false, "the dispatched snapshot is not the stale pre-update one");
+  assert.equal(registry.list()[0]!.pending, false);
+});
+
+test("a rejected dispatch from a replaced task cannot requeue the new task", async () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const rejectors: Array<(error: unknown) => void> = [];
+  const scheduler = new LoopScheduler(
+    timers,
+    registry,
+    () => new Promise<void>((_resolve, reject) => rejectors.push(reject)),
+    () => true,
+  );
+
+  scheduler.start(1_000, "old");
+  timers.advance(1_000);
+  assert.equal(rejectors.length, 1, "the old task dispatched an async run");
+
+  // Replace the loop before the old dispatch promise settles.
+  scheduler.start(1_000, "new");
+  const newId = registry.list()[0]!.id;
+  assert.equal(registry.get(newId)?.pending, false);
+
+  rejectors[0]!(new Error("boom"));
+  await Promise.resolve();
+
+  assert.equal(
+    registry.get(newId)?.pending,
+    false,
+    "a stale rejection must not mark the replacement task pending",
+  );
+  assert.equal(scheduler.flush(), false, "the replacement must not run before its first interval");
+
+  // The replacement's own first run still happens one full interval after start.
+  timers.advance(1_000);
+  assert.equal(rejectors.length, 2, "the replacement fires on schedule, never early");
+});
+
 
