@@ -175,3 +175,25 @@ export function configReader(contents: string): { readFile: ConfigReader; reads:
 export function missingFile(): NodeJS.ErrnoException {
   return Object.assign(new Error("ENOENT"), { code: "ENOENT" }) as NodeJS.ErrnoException;
 }
+
+/**
+ * A synchronous maintenance-prompt reader backed by an in-memory map. Unknown
+ * paths throw ENOENT, and every requested path is recorded for assertions.
+ */
+export function maintenanceReader(files: Record<string, string>): {
+  readFile: (filePath: string) => string;
+  reads: string[];
+} {
+  const reads: string[] = [];
+  return {
+    readFile: (filePath: string): string => {
+      reads.push(filePath);
+      const contents = files[filePath];
+      if (contents === undefined) {
+        throw missingFile();
+      }
+      return contents;
+    },
+    reads,
+  };
+}
