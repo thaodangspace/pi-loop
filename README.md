@@ -24,10 +24,11 @@ and reporting in the conversation while the session stays open.
   abbreviated spellings and a spaced unit, e.g. `30min`, `90s`, `2 hours`,
   `30 min`, `1d`, `2 days`.
 - Intervals are normalized to a cron cadence and the effective value is
-  reported. The scheduler works in whole minutes: seconds round up to `1min`,
-  and steps that do not map to a clean cron cadence round to the nearest one
-  (`7m` → `6min`, `90m` → `2h`). Claude-style boundaries are honored, so a
-  `5min` loop started at 12:03 first runs at 12:05.
+  reported. The scheduler works in whole minutes: seconds round up to the next
+  whole minute (`30s` → `1min`, `61s` → `2min`), and whole-minute steps that do
+  not map to a clean cron cadence round to the nearest one (`7m` → `6min`,
+  `90m` → `2h`). Claude-style boundaries are honored, so a `5min` loop started
+  at 12:03 first runs at 12:05.
 - `/loop stop` cancels the loop and any queued run.
 - `/loop status` reports the active task, the effective interval, and whether a
   run is queued.
@@ -96,10 +97,11 @@ Bare `/loop <task>` (no `every`) reads the optional user-level config file
 ## Behavior and limits
 
 - **Cron-style cadence.** The scheduler works in whole minutes, like the cron
-  layer behind Claude Code's `/loop`. Seconds round up to `1min`, and intervals
-  that do not map to a clean cron step (`7m`, `90m`, `45m`, `5h`) round to the
-  nearest supported cadence. When a request is rounded, the notification says
-  which cadence was picked. Day intervals are supported.
+  layer behind Claude Code's `/loop`. Seconds round up to the next whole minute
+  (`61s` → `2min`), and whole-minute intervals that do not map to a clean cron
+  step (`7m`, `90m`, `45m`, `5h`) round to the nearest supported cadence. When a
+  request is rounded, the notification says which cadence was picked. Day
+  intervals are supported.
 - **Absolute boundaries, no drift.** Fire times are fixed schedule boundaries
   (`anchor + k × cadence`, anchored on the Unix epoch by default), not
   `now + interval`. A late timer, a long agent turn, or a clock jump never

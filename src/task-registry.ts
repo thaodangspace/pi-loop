@@ -115,6 +115,15 @@ function assertPrompt(prompt: string): void {
 }
 
 /**
+ * Freeze a private copy of a schedule so a caller cannot mutate registry state
+ * by holding a reference to the object it passed in. The store stays shallow
+ * until this point; this makes the nested value immutable too.
+ */
+function freezeSchedule(schedule: FixedSchedule): FixedSchedule {
+  return Object.freeze({ intervalMs: schedule.intervalMs, anchor: schedule.anchor });
+}
+
+/**
  * In-memory registry of scheduled tasks scoped to a single session.
  *
  * Design guarantees:
@@ -168,7 +177,7 @@ export class TaskRegistry {
       prompt: input.prompt,
       mode: input.mode,
       createdAt: this.now(),
-      ...(input.schedule === undefined ? {} : { schedule: input.schedule }),
+      ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
       ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
       pending: false,
     });
@@ -222,7 +231,11 @@ export class TaskRegistry {
           ? undefined
           : update.nextFireAt;
     const schedule =
-      update.schedule === undefined ? current.schedule : update.schedule === null ? undefined : update.schedule;
+      update.schedule === undefined
+        ? current.schedule
+        : update.schedule === null
+          ? undefined
+          : freezeSchedule(update.schedule);
     const next: ScheduledTask = Object.freeze({
       id: current.id,
       prompt: update.prompt ?? current.prompt,

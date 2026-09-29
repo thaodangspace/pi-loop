@@ -18,6 +18,15 @@ test("seconds below a minute normalize up to the one-minute cadence", () => {
   assert.equal(MIN_CADENCE_MS, MINUTE_MS, "the scheduler floor is one minute");
 });
 
+test("seconds round up to a whole minute before snapping to a clean step", () => {
+  // 61s and 89s are more than one minute, so they must not collapse to 1min.
+  assert.equal(normalizeCadence(61_000), 2 * MINUTE_MS, "61s rounds up to 2min");
+  assert.equal(normalizeCadence(89_000), 2 * MINUTE_MS, "89s rounds up to 2min");
+  assert.equal(normalizeCadence(121_000), 3 * MINUTE_MS, "121s rounds up to 3min");
+  assert.equal(normalizeCadence(60_001), 2 * MINUTE_MS, "a second over a minute rounds up");
+  assert.equal(normalizeCadence(3 * MINUTE_MS + 1), 4 * MINUTE_MS, "a second over 3min rounds up");
+});
+
 test("clean minute and hour cadences are preserved", () => {
   assert.equal(normalizeCadence(5 * MINUTE_MS), 5 * MINUTE_MS);
   assert.equal(normalizeCadence(30 * MINUTE_MS), 30 * MINUTE_MS);

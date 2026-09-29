@@ -294,7 +294,7 @@ export function usageText(reason?: string): string {
     `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
     `/loop stop                                 cancel the active loop\n` +
     `/loop status                               show the active loop\n` +
-    `Intervals round to a cron cadence: seconds up to 1min, and steps such as 7m or 90m to the nearest supported value.`
+    `Intervals round to a cron cadence: seconds up to the next whole minute, and steps such as 7m or 90m to the nearest supported value.`
   );
 }
 

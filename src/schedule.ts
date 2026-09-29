@@ -5,8 +5,9 @@
  *
  * Claude Code's `/loop` converts an interval into a cron expression, so the
  * finest granularity is one minute and only cadences that divide a calendar
- * field cleanly survive. This module mirrors that behavior without depending on
- * any runtime: the same inputs always yield the same schedule.
+ * field cleanly survive. Seconds round up to whole minutes before a clean step
+ * is chosen. This module mirrors that behavior without depending on any
+ * runtime: the same inputs always yield the same schedule.
  *
  * The scheduler is anchored on a fixed boundary grid (the Unix epoch by
  * default). Because every supported cadence divides a day evenly, the grid
@@ -58,18 +59,22 @@ const CADENCES: readonly number[] = buildCadences();
 /**
  * Round a requested interval to the nearest supported cron cadence.
  *
- * - Anything at or below one minute becomes one minute (cron's granularity).
- * - Intervals that do not map to a clean step, such as `7m` or `90m`, snap to
- *   the nearest cadence. Ties round up (to the longer cadence), matching the
- *   "rounded up" behavior Claude documents for seconds and keeping the loop
- *   from ever running more often than requested.
+ * - Every interval is first ceiled to a whole number of minutes, with a floor of
+ *   one minute. Seconds therefore round *up*, matching Claude: `61s` and `89s`
+ *   become `2min`, and `121s` becomes `3min`, so a loop never runs more often
+ *   than requested.
+ * - Whole-minute values that do not map to a clean step, such as `7m` or `90m`,
+ *   then snap to the nearest cadence. Ties round up (to the longer cadence).
  * - Day intervals are supported up to {@link MAX_CADENCE_MS}.
  */
 export function normalizeCadence(intervalMs: number): number {
   if (!Number.isFinite(intervalMs)) {
     throw new ScheduleError("interval must be a finite number of milliseconds");
   }
-  const requested = Math.max(MIN_CADENCE_MS, Math.round(intervalMs));
+  // Ceil to whole minutes first (cron's granularity, seconds round up), then
+  // choose the nearest clean cron step from that minute grid.
+  const minutes = Math.max(1, Math.ceil(intervalMs / MINUTE_MS));
+  const requested = minutes * MINUTE_MS;
   let best = CADENCES[0]!;
   let bestDistance = Number.POSITIVE_INFINITY;
   for (const cadence of CADENCES) {
