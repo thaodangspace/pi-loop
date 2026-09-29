@@ -8,6 +8,10 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadDefaultInterval, loopConfigPath, type ConfigReader } from "./config.ts";
 import {
+  createScheduledPromptDispatcher,
+  ScheduledPromptRejectedError,
+} from "./dispatch.ts";
+import {
   clampWakeupDelay,
   formatInterval,
   LoopScheduler,
@@ -66,20 +70,44 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   // Maintenance loops resolve their prompt on every run, so an edited
   // `.claude/loop.md` or `~/.claude/loop.md` takes effect on the next iteration.
-  const resolvePrompt = (task: ScheduledTask): string =>
-    task.maintenance ? resolveMaintenancePrompt(deps.maintenance).prompt : task.prompt;
+  // The unified dispatcher classifies the resolved text so a maintenance file
+  // that names a control command is rejected before it can be sent.
+  const dispatcher = createScheduledPromptDispatcher({
+    commands: () => pi.getCommands(),
+    send: (text, options) => {
+      pi.sendUserMessage(text, options);
+    },
+  });
+
+  const resolvePrompt = (task: ScheduledTask): string => {
+    const raw = task.maintenance ? resolveMaintenancePrompt(deps.maintenance).prompt : task.prompt;
+    // Reject control/unsupported forms at resolution time so the scheduler's
+    // existing skip (fixed) / bounded-fallback (self-paced) handling applies,
+    // instead of a run that can never be delivered.
+    const decision = dispatcher.classify(raw);
+    if (decision.action === "reject") {
+      throw new ScheduledPromptRejectedError(decision);
+    }
+    return raw;
+  };
 
   const scheduler = new LoopScheduler(
     timers,
     registry,
     (_task, prompt) => {
-      // A user message, never a shell command. Only sent while idle.
-      pi.sendUserMessage(prompt);
+      // A user message, never a shell command. The dispatcher decides whether Pi
+      // should expand a skill/template or send the text literally, and refuses
+      // to send a rejected control form.
+      dispatcher.dispatch(prompt);
     },
     () => latestCtx?.isIdle() ?? true,
     (error) => {
       if (error instanceof MaintenancePromptError) {
         notify(`Maintenance prompt error: ${error.message}`, "error");
+        return;
+      }
+      if (error instanceof ScheduledPromptRejectedError) {
+        notify(`Scheduled prompt rejected: ${error.message}`, "error");
         return;
       }
       notify(`Loop task failed to send: ${errorMessage(error)}`, "error");
@@ -195,6 +223,15 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
         }
         case "start":
           break;
+      }
+
+      // Fail fast on a slash-prefixed task that is a control command or an
+      // unknown skill, so no loop is created that could never deliver its run.
+      // Plain slash text (a path, prose) and known skills/templates pass.
+      const startDecision = dispatcher.classify(command.task);
+      if (startDecision.action === "reject") {
+        ctx.ui.notify(`Scheduled prompt rejected: ${startDecision.reason}`, "error");
+        return;
       }
 
       if (command.intervalMs === undefined) {
