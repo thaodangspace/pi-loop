@@ -34,6 +34,15 @@ export class FakeTimers implements SchedulerDeps {
     return this.tasks.size;
   }
 
+  /**
+   * Jump the clock forward without firing pending timers, simulating a process
+   * sleep or a clock jump. Overdue timers stay armed and fire on the next
+   * `advance`, coalescing every missed boundary into one run.
+   */
+  sleep(ms: number): void {
+    this.clock += ms;
+  }
+
   /** Advance the clock, firing every due timer in timestamp order. */
   advance(ms: number): void {
     const target = this.clock + ms;
@@ -52,7 +61,8 @@ export class FakeTimers implements SchedulerDeps {
       }
       const task = this.tasks.get(nextId)!;
       this.tasks.delete(nextId);
-      this.clock = task.at;
+      // Never move the clock backwards when an overdue timer fires after a jump.
+      this.clock = Math.max(this.clock, task.at);
       task.fn();
       if (++steps > 10_000) {
         throw new Error("fake timer runaway");

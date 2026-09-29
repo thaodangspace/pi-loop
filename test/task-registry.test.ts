@@ -91,6 +91,18 @@ test("update modifies only the requested fields and keeps identity stable", () =
   assert.throws(() => registry.update("missing", { pending: true }), TaskNotFoundError);
 });
 
+test("a fixed task stores its schedule representation", () => {
+  const schedule = { intervalMs: 5 * 60_000, anchor: 0 } as const;
+  const { registry } = makeRegistry();
+  const created = registry.create({ prompt: "check deploy", mode: "fixed", schedule, nextFireAt: 300_000 });
+  assert.deepEqual(created.schedule, schedule);
+  assert.equal(created.nextFireAt, 300_000);
+
+  const cleared = registry.update(created.id, { schedule: null, nextFireAt: null });
+  assert.equal(cleared.schedule, undefined, "null clears the schedule");
+  assert.equal(cleared.nextFireAt, undefined);
+});
+
 test("snapshots are frozen so callers cannot corrupt registry state", () => {
   const { registry } = makeRegistry();
   const task = registry.create({ prompt: "one", mode: "fixed" });

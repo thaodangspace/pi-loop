@@ -6,9 +6,17 @@
  * The scheduler keeps no task state of its own; the authoritative task record
  * lives in a {@link TaskRegistry}, one per session.
  */
+import {
+  createSchedule,
+  DAY_MS,
+  HOUR_MS,
+  MINUTE_MS,
+  nextFireAt,
+  type FixedSchedule,
+} from "./schedule.ts";
 import type { ScheduledTask, TaskRegistry } from "./task-registry.ts";
 
-/** Minimum accepted interval. Keeps the scheduler from creating a tight timer. */
+/** Minimum accepted parse-time interval. Sub-minute values normalize at scheduling. */
 export const MIN_INTERVAL_MS = 1_000;
 /** Maximum accepted interval; `setTimeout` is capped at a signed 32-bit delay. */
 export const MAX_INTERVAL_MS = 2_147_483_647;
@@ -30,6 +38,9 @@ const UNIT_MS: Readonly<Record<string, number>> = {
   hrs: 3_600_000,
   hour: 3_600_000,
   hours: 3_600_000,
+  d: 86_400_000,
+  day: 86_400_000,
+  days: 86_400_000,
 };
 
 /** Error thrown for invalid interval syntax or out-of-range values. */
@@ -77,8 +88,9 @@ export function parseInterval(text: string): number {
 
 /** Format a millisecond interval in the largest exact unit. */
 export function formatInterval(ms: number): string {
-  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
-  if (ms % 60_000 === 0) return `${ms / 60_000}min`;
+  if (ms % DAY_MS === 0) return `${ms / DAY_MS}d`;
+  if (ms % HOUR_MS === 0) return `${ms / HOUR_MS}h`;
+  if (ms % MINUTE_MS === 0) return `${ms / MINUTE_MS}min`;
   return `${ms / 1_000}s`;
 }
 
@@ -277,11 +289,12 @@ export function usageText(reason?: string): string {
   const head = reason ? `Usage error: ${reason}.\n` : "";
   return (
     `${head}/loop <task>                           repeat <task> at the configured default (1min)\n` +
-    `/loop <n><unit> <task>                    set the interval (units: s, min, h)\n` +
+    `/loop <n><unit> <task>                    set the interval (units: s, min, h, d)\n` +
     `/loop <task> every <n><unit>              set the interval after the task\n` +
     `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
     `/loop stop                                 cancel the active loop\n` +
-    `/loop status                               show the active loop`
+    `/loop status                               show the active loop\n` +
+    `Intervals round to a cron cadence: seconds up to 1min, and steps such as 7m or 90m to the nearest supported value.`
   );
 }
 
@@ -297,9 +310,12 @@ export function maintenanceText(intervalMs?: number): string {
 /** Snapshot of scheduler state for `/loop status`. */
 export interface LoopStatus {
   active: boolean;
+  /** Effective, normalized cadence in milliseconds. */
   intervalMs: number;
   task: string;
   pending: boolean;
+  /** The stored schedule representation, when a fixed loop is active. */
+  schedule?: FixedSchedule;
 }
 
 /** Injected timer primitives so tests can drive time deterministically. */
@@ -317,16 +333,18 @@ export const systemTimers: SchedulerDeps = {
 };
 
 /**
- * One interval loop scoped to a single session.
+ * One fixed loop scoped to a single session.
  *
- * The scheduler holds only schedule configuration (the interval and the active
- * task's ID). The task record itself lives in the shared {@link TaskRegistry},
- * so the active loop is represented through the registry and time-stamped with
- * the injected clock.
+ * The scheduler holds the active task's ID and its schedule; the task record
+ * itself lives in the shared {@link TaskRegistry}.
  *
  * Design guarantees:
- * - The first tick fires one full interval after `start`, never immediately.
- * - At most one pending run exists; busy ticks coalesce into it.
+ * - A requested interval is normalized to a supported cron cadence (minimum
+ *   one minute; seconds and awkward steps round to the nearest cadence).
+ * - Fire times are absolute schedule boundaries, so a late tick, a long busy
+ *   period, or a clock jump never shifts later boundaries.
+ * - At most one pending run exists; missed boundaries coalesce into it and are
+ *   never replayed as a backlog.
  * - A generation counter makes callbacks from a replaced/stopped loop no-ops.
  * - `stop`/`dispose` are idempotent and leave no live timer.
  */
@@ -334,7 +352,7 @@ export class LoopScheduler {
   private timer: unknown = null;
   private generation = 0;
   private disposed = false;
-  private intervalMs = 0;
+  private schedule: FixedSchedule | undefined;
   private taskId: string | undefined;
 
   constructor(
@@ -353,14 +371,16 @@ export class LoopScheduler {
       throw new Error("task must not be empty");
     }
     this.stop();
+    const schedule = createSchedule(intervalMs);
     const created = this.registry.create({
       prompt: task,
       mode: "fixed",
-      nextFireAt: this.deps.now() + intervalMs,
+      schedule,
+      nextFireAt: nextFireAt(schedule, this.deps.now()),
     });
     this.taskId = created.id;
-    this.intervalMs = intervalMs;
-    this.schedule(this.generation);
+    this.schedule = schedule;
+    this.arm(this.generation, created);
   }
 
   /** Cancel the active loop. Returns whether a loop was running. Idempotent. */
@@ -372,7 +392,7 @@ export class LoopScheduler {
       this.registry.delete(this.taskId);
     }
     this.taskId = undefined;
-    this.intervalMs = 0;
+    this.schedule = undefined;
     return active;
   }
 
@@ -403,9 +423,10 @@ export class LoopScheduler {
     const task = this.currentTask();
     return {
       active: task !== undefined,
-      intervalMs: this.intervalMs,
+      intervalMs: this.schedule?.intervalMs ?? 0,
       task: task?.prompt ?? "",
       pending: task?.pending ?? false,
+      ...(this.schedule === undefined ? {} : { schedule: this.schedule }),
     };
   }
 
@@ -413,14 +434,29 @@ export class LoopScheduler {
     return this.taskId === undefined ? undefined : this.registry.get(this.taskId);
   }
 
-  private schedule(generation: number): void {
-    if (this.taskId !== undefined) {
-      this.registry.update(this.taskId, { nextFireAt: this.deps.now() + this.intervalMs });
+  /**
+   * Arm a timer for the task's next boundary. The boundary is taken from the
+   * stored schedule, so arming late (after a slow tick or a clock jump) skips
+   * missed boundaries instead of shifting the schedule.
+   */
+  private arm(generation: number, task: ScheduledTask): void {
+    if (generation !== this.generation) {
+      return;
+    }
+    const schedule = this.registry.get(task.id)?.schedule ?? task.schedule;
+    if (!schedule) {
+      return;
+    }
+    const now = this.deps.now();
+    const due =
+      task.nextFireAt !== undefined && task.nextFireAt > now ? task.nextFireAt : nextFireAt(schedule, now);
+    if (due !== task.nextFireAt) {
+      this.registry.update(task.id, { nextFireAt: due });
     }
     this.timer = this.deps.setTimer(() => {
       this.timer = null;
       this.onTick(generation);
-    }, this.intervalMs);
+    }, due - now);
   }
 
   private onTick(generation: number): void {
@@ -428,7 +464,7 @@ export class LoopScheduler {
       return;
     }
     const task = this.currentTask();
-    if (!task) {
+    if (!task || !task.schedule) {
       return;
     }
     if (this.isIdle()) {
@@ -438,10 +474,18 @@ export class LoopScheduler {
       this.registry.update(task.id, { pending: true });
     }
     // Dispatch may have stopped or replaced the loop; do not re-arm then.
-    if (generation !== this.generation || !this.currentTask()) {
+    if (generation !== this.generation) {
       return;
     }
-    this.schedule(generation);
+    const current = this.currentTask();
+    if (!current || !current.schedule) {
+      return;
+    }
+    // Boundaries are absolute, so derive the next one from the schedule rather
+    // than from the tick time. Missed boundaries collapse into the current run.
+    const due = nextFireAt(current.schedule, this.deps.now());
+    const advanced = this.registry.update(current.id, { nextFireAt: due });
+    this.arm(generation, advanced);
   }
 
   private safeDispatch(task: ScheduledTask, generation: number): void {
