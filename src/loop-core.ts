@@ -81,22 +81,132 @@ export function formatInterval(ms: number): string {
 /** A parsed `/loop` invocation. */
 export type LoopCommand =
   | { type: "start"; task: string; intervalMs?: number }
+  | { type: "maintenance"; intervalMs?: number }
   | { type: "stop" }
   | { type: "status" }
   | { type: "usage"; reason: string };
 
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** True when `word` is a recognised interval unit (used for spaced forms). */
+function isKnownUnit(word: string): boolean {
+  return Object.prototype.hasOwnProperty.call(UNIT_MS, word.toLowerCase());
+}
+
+/**
+ * True when text opens like an interval: an optional sign followed by a digit or
+ * a dot-leading number such as `.5h`. Used so fraction-looking input fails
+ * closed instead of leaking into the task.
+ */
+function looksLikeInterval(text: string): boolean {
+  return /^[-+]?(?:\d|\.\d)/.test(text);
+}
+
+type LeadingInterval =
+  | { kind: "interval"; intervalMs: number; task: string }
+  | { kind: "malformed"; reason: string }
+  | { kind: "none" };
+
+/**
+ * Classify a leading interval token, glued (`5m <task>`) or spaced
+ * (`5 min <task>`).
+ *
+ * Any leading numeric token is treated as interval intent. When it cannot be
+ * understood as an interval (missing/unknown unit, fraction, out of range, or
+ * trailing digits such as `1h30min`) the command fails closed with a reason so
+ * interval-looking text can never leak into the task.
+ */
+function leadingInterval(args: string): LeadingInterval {
+  const tokens = args.split(/\s+/);
+  const first = tokens[0] ?? "";
+  if (!looksLikeInterval(first)) {
+    return { kind: "none" };
+  }
+  let spec: string | undefined;
+  let consumed = 1;
+  if (/^\d+[a-z]+$/i.test(first)) {
+    spec = first;
+  } else if (/^\d+$/.test(first) && tokens[1] && isKnownUnit(tokens[1])) {
+    spec = `${first}${tokens[1]}`;
+    consumed = 2;
+  }
+  if (!spec) {
+    return {
+      kind: "malformed",
+      reason: `invalid interval "${first}": use a positive number with a unit such as 30min`,
+    };
+  }
+  try {
+    return { kind: "interval", intervalMs: parseInterval(spec), task: tokens.slice(consumed).join(" ") };
+  } catch (error) {
+    return { kind: "malformed", reason: reasonOf(error) };
+  }
+}
+
+type TrailingInterval =
+  | { kind: "interval"; intervalMs: number; prompt: string }
+  | { kind: "malformed"; reason: string }
+  | { kind: "none" };
+
+/**
+ * Classify a trailing `every <interval>` clause (`<prompt> every 5m`).
+ *
+ * Only the final `every` is considered. Interval-looking text that cannot be
+ * parsed fails closed; plain prose after `every` leaves the whole argument as a
+ * literal task so tasks such as `review every file in src` keep working.
+ */
+function trailingInterval(args: string): TrailingInterval {
+  const match = /^(?<prompt>[\s\S]*)\s+every(?:\s+(?<interval>[\s\S]+))?$/i.exec(args);
+  if (!match?.groups) {
+    return { kind: "none" };
+  }
+  const prompt = match.groups.prompt!.trim();
+  if (!prompt) {
+    return { kind: "none" };
+  }
+  const intervalText = (match.groups.interval ?? "").trim();
+  if (!intervalText) {
+    return { kind: "malformed", reason: "missing interval after every" };
+  }
+  const spec = /^(\d+)\s*([a-z]+)$/i.exec(intervalText);
+  if (!spec) {
+    if (looksLikeInterval(intervalText)) {
+      return {
+        kind: "malformed",
+        reason: `invalid interval "${intervalText.split(/\s+/)[0]}": use a positive number with a unit such as 30min`,
+      };
+    }
+    return { kind: "none" };
+  }
+  try {
+    return { kind: "interval", intervalMs: parseInterval(`${spec[1]}${spec[2]}`), prompt };
+  } catch (error) {
+    return { kind: "malformed", reason: reasonOf(error) };
+  }
+}
+
 /**
  * Parse the raw argument string of `/loop`.
  *
- * Precedence: `stop` and `status` are exact commands, `every` introduces an
- * explicit interval, and anything else is a literal task using the default
- * interval. Keeping `stop`/`status` exact means a task such as `stop the build
- * server and restart it` stays a task rather than a control command.
+ * Supported forms:
+ * - `<interval> <prompt>` (Claude-style, e.g. `5m check deploy`)
+ * - `<prompt> every <interval>`
+ * - `<prompt>` (literal task, default interval)
+ * - `<interval>` and bare `/loop` (maintenance loops; prompt wiring lands with
+ *   the maintenance-mode work)
+ * - `every <interval> <prompt>` (Pi compatibility alias)
+ *
+ * Precedence: `stop`/`status` are exact commands, then the `every` alias, then a
+ * trailing `every` clause, then a leading interval, then a literal task. An
+ * interval-looking token that cannot be parsed is reported as a usage error
+ * rather than becoming task text, and leaves any existing loop untouched.
  */
 export function parseLoopCommand(rawArgs: string): LoopCommand {
   const args = rawArgs.trim();
   if (!args) {
-    return { type: "usage", reason: "missing task" };
+    return { type: "maintenance" };
   }
   const keyword = args.toLowerCase();
   if (keyword === "stop") {
@@ -106,6 +216,7 @@ export function parseLoopCommand(rawArgs: string): LoopCommand {
     return { type: "status" };
   }
 
+  // Pi compatibility alias: `every <interval> <prompt>`.
   const everyMatch = /^every(?:\s+([\s\S]*))?$/i.exec(args);
   if (everyMatch) {
     const rest = (everyMatch[1] ?? "").trim();
@@ -123,13 +234,35 @@ export function parseLoopCommand(rawArgs: string): LoopCommand {
     try {
       intervalMs = parseInterval(`${digits}${unit}`);
     } catch (error) {
-      return { type: "usage", reason: error instanceof Error ? error.message : String(error) };
+      return { type: "usage", reason: reasonOf(error) };
     }
     const trimmedTask = task.trim();
     if (!trimmedTask) {
-      return { type: "usage", reason: "missing task" };
+      return { type: "maintenance", intervalMs };
     }
     return { type: "start", intervalMs, task: trimmedTask };
+  }
+
+  // Claude-style `<prompt> every <interval>`.
+  const trailing = trailingInterval(args);
+  if (trailing.kind === "malformed") {
+    return { type: "usage", reason: trailing.reason };
+  }
+  if (trailing.kind === "interval") {
+    return { type: "start", intervalMs: trailing.intervalMs, task: trailing.prompt };
+  }
+
+  // Claude-style `<interval> <prompt>` and interval-only `<interval>`.
+  const leading = leadingInterval(args);
+  if (leading.kind === "malformed") {
+    return { type: "usage", reason: leading.reason };
+  }
+  if (leading.kind === "interval") {
+    const task = leading.task.trim();
+    if (!task) {
+      return { type: "maintenance", intervalMs: leading.intervalMs };
+    }
+    return { type: "start", intervalMs: leading.intervalMs, task };
   }
 
   return { type: "start", task: args };
@@ -139,10 +272,21 @@ export function parseLoopCommand(rawArgs: string): LoopCommand {
 export function usageText(reason?: string): string {
   const head = reason ? `Usage error: ${reason}.\n` : "";
   return (
-    `${head}/loop <task>                             repeat <task> at the configured default (1min)\n` +
-    `/loop every <n><unit> <task>             set the interval (units: s, min, h)\n` +
-    `/loop stop                                cancel the active loop\n` +
-    `/loop status                              show the active loop`
+    `${head}/loop <task>                           repeat <task> at the configured default (1min)\n` +
+    `/loop <n><unit> <task>                    set the interval (units: s, min, h)\n` +
+    `/loop <task> every <n><unit>              set the interval after the task\n` +
+    `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
+    `/loop stop                                 cancel the active loop\n` +
+    `/loop status                               show the active loop`
+  );
+}
+
+/** Guidance for bare/interval-only maintenance loops that are not wired up yet. */
+export function maintenanceText(intervalMs?: number): string {
+  const interval = intervalMs === undefined ? "5m" : formatInterval(intervalMs);
+  return (
+    `Maintenance loops (bare or interval-only /loop) are not available yet.\n` +
+    `Add a task to start a loop, e.g. /loop ${interval} <task>.`
   );
 }
 

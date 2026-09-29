@@ -10,6 +10,7 @@ import { loadDefaultInterval, loopConfigPath, type ConfigReader } from "./config
 import {
   formatInterval,
   LoopScheduler,
+  maintenanceText,
   parseLoopCommand,
   systemTimers,
   usageText,
@@ -90,6 +91,12 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
         }
         case "status":
           describe(ctx);
+          return;
+        case "maintenance":
+          // Recognized so interval-looking input never becomes task text, but
+          // the maintenance prompt (loop.md) is a later change. Leave any
+          // existing loop untouched.
+          ctx.ui.notify(maintenanceText(command.intervalMs), "warning");
           return;
         case "start":
           break;
