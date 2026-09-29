@@ -267,7 +267,9 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   // `agent_settled` is Pi's final idle boundary. Settle any self-paced iteration
   // first (so a run we are about to flush cannot be mistaken for a miss), then
-  // flush one coalesced pending run.
+  // flush every distinct due task in the scheduler's deterministic order. A
+  // flush stops early if a dispatch starts work again; the remainder resumes at
+  // the next idle boundary.
   pi.on("agent_settled", (_event, ctx) => {
     latestCtx = ctx;
     const settled = scheduler.settleIteration();
@@ -286,7 +288,9 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   });
 
   pi.on("session_shutdown", () => {
-    scheduler.stop();
+    // Stop every tracked task (not just the command-owned loop) so no timer or
+    // stale callback survives, then drop the records.
+    scheduler.stopAll();
     // Drop every task so a reused instance cannot leak state into another session.
     registry.clear();
     latestCtx = undefined;
