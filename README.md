@@ -73,6 +73,33 @@ The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
 command, and Pi's usual tool permissions apply.
 
+### Scheduled-prompt dispatch
+
+Every scheduled run — fixed, self-paced, and maintenance — is delivered through
+one dispatch layer that classifies the prompt before sending:
+
+- **Plain text is sent verbatim.** Ordinary tasks, and any `/…` text that does
+  not name a loaded command (for example a path such as `/etc/hosts is stale`),
+  are delivered exactly as written with Pi's template expansion off, so nothing
+  is rewritten or interpreted.
+- **A loaded skill or prompt template is expanded.** Scheduling
+  `/skill:pdf-tools` or a template such as `/review concurrency` sends the
+  prompt with expansion on, and Pi expands it the same way interactive input
+  would.
+- **Control and unsupported forms are rejected and reported.** An extension
+  command (the loop's own `/loop`, a scheduler command, `/reload`, or any other
+  extension command), a built-in interactive command, or an unknown
+  `/skill:<name>` is refused with an error notification instead of being sent.
+  This prevents a loop from accidentally running session control. A rejected
+  `/loop <task>` starts no loop; a rejected maintenance prompt skips that run
+  (a fixed loop retries at the next boundary, a self-paced loop uses its
+  bounded fallback).
+
+Because extension commands are executable and skills/templates are content, only
+the latter two categories are ever expanded. The classifier uses Pi's own
+`getCommands()` output, so it tracks the commands actually loaded in the
+session.
+
 ## Maintenance loops
 
 A bare `/loop` (or interval-only `/loop <n><unit>`) runs a maintenance pass
@@ -115,9 +142,9 @@ pending, without starting unrelated work or taking irreversible actions.
 - Node 22+ for development and tests.
 
 The extension uses only the documented Pi extension API (`registerCommand`,
-`sendUserMessage`, `ctx.isIdle()`, and the `session_start` / `agent_start` /
-`agent_settled` / `session_shutdown` events). It does not spawn processes or
-timers at load; a timer exists only while a loop is active.
+`getCommands`, `sendUserMessage`, `ctx.isIdle()`, and the `session_start` /
+`agent_start` / `agent_settled` / `session_shutdown` events). It does not spawn
+processes or timers at load; a timer exists only while a loop is active.
 
 ## Install
 
@@ -231,17 +258,24 @@ The logic is split so it can be tested without Pi:
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
+| `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
 | `src/index.ts` | Pi wiring: command, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
-timers overdue), a deterministic registry factory, and a fake Pi API. Scheduler
-and adapter tests never sleep — they drive time explicitly and assert boundary
-alignment, normalization, coalescing, long busy periods, clock jumps,
+timers overdue), a deterministic registry factory, and a fake Pi API whose
+`sendUserMessage` reproduces Pi's expansion semantics (a matching extension
+command executes; skills and templates expand; otherwise the text is literal).
+Scheduler and adapter tests never sleep — they drive time explicitly and assert
+boundary alignment, normalization, coalescing, long busy periods, clock jumps,
 replacement, stop, dispatch errors, cleanup, and the self-paced reschedule,
 clamp, bounded-fallback, termination, and stale-callback paths. Maintenance
 coverage adds file lookup and precedence, missing/unreadable/empty files,
 byte-bounded truncation, custom-prompt isolation, dynamic reload, both command
-forms, and per-run prompt resolution on the scheduler.
+forms, and per-run prompt resolution on the scheduler. Dispatch coverage adds
+plain text, literal slash text, skill/template expansion, rejected control and
+unknown-skill forms (at start and on a maintenance run), and cross-checks the
+policy against the installed Pi package's real built-in command list and
+`expandPromptTemplate`.
 
 ### Live smoke test
 
@@ -278,6 +312,12 @@ stream shows `extension_ui_request` notifications for the loop and a
   uses its bounded fallback.
 - **`Loop config error: ...`** — `loop.json` is malformed, unreadable, or has an
   invalid `defaultInterval`. Fix the file or use an explicit interval.
+- **`Scheduled prompt rejected: ...`** — the scheduled text names a control
+  command (an extension command such as `/loop`, a built-in interactive command
+  such as `/reload`) or an unknown `/skill:<name>`. It is not sent. A `/loop
+  <task>` that is rejected starts no loop; a rejected maintenance prompt skips
+  that run. Remove the leading `/` to send the text literally, or use a loaded
+  skill or prompt template.
 - **A task beginning with `stop`/`status` is treated as a command.** Only the
   exact words `stop` and `status` are commands; longer text such as
   `stop the build server` is a task.

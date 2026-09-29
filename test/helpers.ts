@@ -4,6 +4,7 @@
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ConfigReader } from "../src/config.ts";
+import type { SlashCommandLike } from "../src/dispatch.ts";
 import type { SchedulerDeps } from "../src/loop-core.ts";
 import { TaskRegistry } from "../src/task-registry.ts";
 
@@ -112,15 +113,49 @@ export class FakeCtx {
 
 export type FakeHandler = (event: unknown, ctx: FakeCtx) => unknown;
 
-/** Minimal ExtensionAPI that records registrations and outbound messages. */
+export interface FakeSendCall {
+  /** The text Pi would deliver to the model, after any expansion. */
+  text: string;
+  expandPromptTemplates: boolean;
+}
+
+/**
+ * Minimal ExtensionAPI that records registrations and outbound messages.
+ *
+ * `sendUserMessage` reproduces the dispatch semantics of the installed Pi
+ * (`AgentSession.prompt` in 0.87.1) rather than accepting anything:
+ *
+ * - `expandPromptTemplates` defaults to false, so text is delivered literally.
+ * - With expansion on and a leading `/`, a matching extension command is
+ *   *executed* and no prompt is delivered; then `/skill:<name>` is expanded to a
+ *   `<skill>` block; then a prompt template is expanded.
+ *
+ * This makes a bug that enables expansion for a control command show up as an
+ * executed command in `executedCommands` instead of a silently delivered string.
+ */
 export class FakePi {
   readonly commands = new Map<string, { handler: (args: string, ctx: FakeCtx) => Promise<void> }>();
   readonly handlers = new Map<string, FakeHandler[]>();
+  /** Delivered prompt texts (post-expansion), one per send. */
   readonly sent: string[] = [];
+  /** Every send with the expansion flag the dispatcher chose. */
+  readonly calls: FakeSendCall[] = [];
+  /** Extension commands Pi would have executed instead of sending a prompt. */
+  readonly executedCommands: string[] = [];
+  /** Slash commands returned by `getCommands()`: extension, prompt, and skill. */
+  readonly slashCommands: SlashCommandLike[] = [];
+  /** Prompt templates available for expansion, by command name. */
+  readonly templates = new Map<string, string>();
+  /** Skill bodies available for expansion, by skill name. */
+  readonly skills = new Map<string, string>();
   sendError: Error | undefined;
 
   registerCommand(name: string, options: { handler: (args: string, ctx: FakeCtx) => Promise<void> }): void {
     this.commands.set(name, options);
+    // Real Pi reports registered commands through getCommands().
+    if (!this.slashCommands.some((command) => command.name === name && command.source === "extension")) {
+      this.slashCommands.push({ name, source: "extension" });
+    }
   }
 
   on(event: string, handler: FakeHandler): () => void {
@@ -135,11 +170,48 @@ export class FakePi {
     };
   }
 
-  sendUserMessage(content: string | unknown): void {
+  /** Pi's `getCommands()`: extension commands, prompt templates, and skills. */
+  getCommands(): SlashCommandLike[] {
+    return [...this.slashCommands];
+  }
+
+  sendUserMessage(content: string | unknown, options?: { expandPromptTemplates?: boolean }): void {
     if (this.sendError) {
       throw this.sendError;
     }
-    this.sent.push(typeof content === "string" ? content : JSON.stringify(content));
+    const text = typeof content === "string" ? content : JSON.stringify(content);
+    const expand = options?.expandPromptTemplates ?? false;
+    let delivered = text;
+    if (expand && text.startsWith("/")) {
+      const space = text.indexOf(" ");
+      const commandName = space === -1 ? text.slice(1) : text.slice(1, space);
+      const isExtension = this.slashCommands.some(
+        (command) => command.source === "extension" && command.name === commandName,
+      );
+      if (isExtension) {
+        // Pi executes the extension command and sends no prompt.
+        this.executedCommands.push(commandName);
+        return;
+      }
+      const skillName = text.startsWith("/skill:")
+        ? space === -1
+          ? text.slice(7)
+          : text.slice(7, space)
+        : undefined;
+      if (skillName !== undefined && this.skills.has(skillName)) {
+        const args = space === -1 ? "" : text.slice(space + 1).trim();
+        const block = `<skill name="${skillName}">\n${this.skills.get(skillName)}\n</skill>`;
+        delivered = args ? `${block}\n\n${args}` : block;
+      } else {
+        const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text);
+        const templateName = match?.[1];
+        if (templateName !== undefined && this.templates.has(templateName)) {
+          delivered = this.templates.get(templateName)!;
+        }
+      }
+    }
+    this.calls.push({ text: delivered, expandPromptTemplates: expand });
+    this.sent.push(delivered);
   }
 
   async run(command: string, args: string, ctx: FakeCtx): Promise<void> {
