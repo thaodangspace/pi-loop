@@ -2,7 +2,7 @@
  * Deterministic fakes shared by the test suites: a manual timer queue and a
  * minimal Pi extension API/context.
  */
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ConfigReader } from "../src/config.ts";
 import type { SlashCommandLike } from "../src/dispatch.ts";
 import type { SchedulerDeps } from "../src/loop-core.ts";
@@ -164,6 +164,13 @@ export class FakePi {
   /** Custom entries appended via `appendEntry`, in order. */
   readonly appended: Array<{ customType: string; data: unknown }> = [];
   sendError: Error | undefined;
+
+  /** Tools registered via `registerTool`, keyed by name. */
+  readonly tools = new Map<string, ToolDefinition>();
+
+  registerTool(tool: ToolDefinition): void {
+    this.tools.set(tool.name, tool);
+  }
 
   registerCommand(name: string, options: { handler: (args: string, ctx: FakeCtx) => Promise<void> }): void {
     this.commands.set(name, options);

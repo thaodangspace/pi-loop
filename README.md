@@ -67,7 +67,8 @@ comes due while Pi is busy is queued and delivered once when idle, and repeated
 misses coalesce into a single run rather than replaying a backlog.
 
 The wakeup service is scheduler state, not a prompt-text convention. The
-model-facing operations that call it are tracked separately.
+model-facing operations that call it (`schedule_wakeup` and `stop_wakeup`) and
+the task tools are described under [Model-callable tools](#model-callable-tools).
 
 The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
@@ -288,6 +289,50 @@ ignore the file.
 - Process sleep can delay a run; on wake, missed boundaries collapse into one
   run and the schedule resumes on the grid.
 
+## Model-callable tools
+
+Alongside the `/loop` command, the extension registers five model-callable tools.
+They operate on the **same session-scoped task registry and scheduler** as
+`/loop`, so a task created by a tool appears in the registry, participates in the
+same due queue and timers, and is persisted the same way.
+
+| Tool | Kind | Purpose |
+|---|---|---|
+| `schedule_task` | Mutating | Create a recurring fixed task from `interval`, `prompt`, and an optional `expiresIn`. Returns the stable task ID. |
+| `list_scheduled_tasks` | Read-only | List active tasks with ID, mode, cadence, next fire time, expiry, and pending status. |
+| `delete_scheduled_task` | Mutating | Delete one task by its stable ID, cancelling its timer and any queued run. |
+| `schedule_wakeup` | Mutating | Choose the next wakeup of the active self-paced loop from `delayMs` and an optional `reason`; the scheduler clamps to 1 minute–1 hour. |
+| `stop_wakeup` | Mutating | Stop the active self-paced loop and cancel its future wakeups. |
+
+Coherence with `/loop`:
+
+- Tool-created tasks are **independent** of the command-owned loop:
+  `schedule_task` never replaces the loop, and `stop_wakeup` and `/loop stop`
+  never cancel tool-created tasks. Use `delete_scheduled_task` for those.
+- `/loop status` keeps describing the command-owned loop only; use
+  `list_scheduled_tasks` to see every task.
+- `schedule_wakeup` and `stop_wakeup` are scoped to the **active self-paced
+  loop** and throw when no such loop is running, so they cannot reschedule or
+  cancel a fixed task.
+
+Validation and safety boundaries:
+
+- Intervals and `expiresIn` use the same parser as `/loop` (`s`, `min`, `h`,
+  `d`; positive whole numbers). Malformed values throw and change nothing.
+- Prompts are validated non-empty and classified like `/loop` prompts, so a
+  control command or unknown skill is rejected before a task is created.
+- The active-task limit and an expiry that lands before the first run are
+  reported as errors, never as a task with a dead ID.
+- `delete_scheduled_task` matches the ID exactly; an unknown ID produces a
+  not-found error and no other task is touched. Deleting a task that has a
+  queued run removes that queued run.
+- Pi's tool contract produces a **failed tool result** when `execute()` throws;
+  this extension throws typed errors for invalid input instead of encoding
+  failures in content. The installed `ToolDefinition` API has no
+  `annotations`/`readOnlyHint` field, so read-only vs mutating intent is
+  expressed through the description prefix, `promptGuidelines`, and
+  `executionMode: "sequential"` (the tools share mutable scheduler state).
+
 ## Costs and safety
 
 Every run sends a real prompt to the model, consuming tokens and possibly
@@ -316,7 +361,8 @@ The logic is split so it can be tested without Pi:
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
-| `src/index.ts` | Pi wiring: command, idle events, per-run prompt resolution, and lifecycle cleanup. |
+| `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
+| `src/index.ts` | Pi wiring: command, tool registration, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
 timers overdue), a deterministic registry factory, and a fake Pi API whose
@@ -348,7 +394,12 @@ newer-version or malformed mutation from resurrecting a deleted task, expired
 recurring tasks, missed one-shots, self-paced exclusion, scheduler
 create/update/delete emission, expiry and one-shot teardown, and an
 extension-level reload/resume that preserves stable IDs without duplicate timers
-or entries.
+or entries. Tool coverage adds the registration contract (distinct names,
+TypeBox schemas, read-only vs mutating metadata, sequential execution), fixed
+creation/firing/expiry, malformed interval/prompt/control-prompt rejection, the
+task limit, exact-ID deletion and unknown-ID not-found, pending-run cancellation,
+read-only listing, self-paced clamp/reschedule/stop, and `/loop`/tool registry
+coherence and restore.
 
 ### Live smoke test
 
