@@ -92,6 +92,11 @@ export interface FakeNotification {
 export class FakeCtx {
   readonly notifications: FakeNotification[] = [];
   idle = true;
+  /** Active-branch entries returned by `sessionManager.getBranch()`. */
+  branch: Array<{ type: string; customType?: string; data?: unknown; id?: string; parentId?: string | null }> = [];
+  readonly sessionManager = {
+    getBranch: (): unknown[] => this.branch,
+  };
   readonly ui = {
     notify: (message: string, type?: "info" | "warning" | "error"): void => {
       this.notifications.push({ message, type });
@@ -148,6 +153,8 @@ export class FakePi {
   readonly templates = new Map<string, string>();
   /** Skill bodies available for expansion, by skill name. */
   readonly skills = new Map<string, string>();
+  /** Custom entries appended via `appendEntry`, in order. */
+  readonly appended: Array<{ customType: string; data: unknown }> = [];
   sendError: Error | undefined;
 
   registerCommand(name: string, options: { handler: (args: string, ctx: FakeCtx) => Promise<void> }): void {
@@ -212,6 +219,11 @@ export class FakePi {
     }
     this.calls.push({ text: delivered, expandPromptTemplates: expand });
     this.sent.push(delivered);
+  }
+
+  /** Append a custom entry the way Pi persists extension state. */
+  appendEntry(customType: string, data?: unknown): void {
+    this.appended.push({ customType, data });
   }
 
   async run(command: string, args: string, ctx: FakeCtx): Promise<void> {

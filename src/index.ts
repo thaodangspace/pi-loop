@@ -26,6 +26,7 @@ import {
   resolveMaintenancePrompt,
   type ResolveMaintenanceOptions,
 } from "./maintenance.ts";
+import { collectEntries, PERSISTENCE_CUSTOM_TYPE, planRestore } from "./persistence.ts";
 import { TaskRegistry, type ScheduledTask } from "./task-registry.ts";
 
 export interface LoopExtensionDeps {
@@ -113,7 +114,35 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       notify(`Loop task failed to send: ${errorMessage(error)}`, "error");
     },
     resolvePrompt,
+    // Persist fixed and one-shot mutations as Pi session custom entries so the
+    // tasks survive reload/resume; self-paced wakeups are never persisted.
+    (event) => {
+      pi.appendEntry(PERSISTENCE_CUSTOM_TYPE, event);
+    },
   );
+
+  /**
+   * Rebuild this session's scheduler state from the active branch only.
+   *
+   * Disposes the previous branch/session state first, then replays this
+   * extension's custom entries in branch order. Abandoned branches are not
+   * replayed because they are not part of `getBranch()`. Restoring writes no new
+   * entries, and a task whose ID is already tracked is not duplicated.
+   */
+  const reconstruct = (ctx: ExtensionContext): void => {
+    // Teardown is non-persisting: a reload must not tombstone the tasks it is
+    // about to restore.
+    scheduler.stopAll();
+    registry.clear();
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    const plan = planRestore(collectEntries(branch), timers.now());
+    for (const issue of plan.issues) {
+      notify(`Loop persistence: ${issue}`, "warning");
+    }
+    for (const task of plan.tasks) {
+      scheduler.restore(task);
+    }
+  };
 
   const describe = (ctx: ExtensionCommandContext): void => {
     const state = scheduler.status();
@@ -258,6 +287,15 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    reconstruct(ctx);
+  });
+
+  // Navigating the session tree changes the active branch, so rebuild from the
+  // new branch: tasks created on an abandoned branch are dropped and tasks on
+  // the entered branch are restored (without duplicating entries).
+  pi.on("session_tree", (_event, ctx) => {
+    latestCtx = ctx;
+    reconstruct(ctx);
   });
 
   // Refresh the context and idle snapshot whenever an agent run boundary moves.

@@ -162,7 +162,8 @@ pending, without starting unrelated work or taking irreversible actions.
 - Node 22+ for development and tests.
 
 The extension uses only the documented Pi extension API (`registerCommand`,
-`getCommands`, `sendUserMessage`, `ctx.isIdle()`, and the `session_start` /
+`getCommands`, `sendUserMessage`, `appendEntry`, `ctx.isIdle()`,
+`ctx.sessionManager.getBranch()`, and the `session_start` / `session_tree` /
 `agent_start` / `agent_settled` / `session_shutdown` events). It does not spawn
 processes or timers at load; a timer exists only while a loop is active.
 
@@ -240,8 +241,20 @@ ignore the file.
   once Pi is idle again. Repeated misses for the same task coalesce, and distinct
   due tasks flush in the documented order (earliest missed deadline first, ties
   by registration). Occurrences are never replayed one-per-missed-interval.
-- **In-memory only.** Loops do not survive restart, reload, or session
-  replacement, and they do not run while Pi is closed.
+- **Fixed loops persist; self-paced loops do not.** A fixed loop
+  (`/loop <n><unit> <task>` or `/loop <task> every <n><unit>`) and any
+  one-shot/fixed task scheduled through the scheduler are recorded in the
+  session as versioned custom entries. On resume or on re-entering a branch they
+  are rebuilt with the same stable ID and schedule. Self-paced wakeup state is
+  deliberately ephemeral, so a self-paced loop does not survive restart, reload,
+  or session replacement. Stops and expiry are recorded as tombstones, so a
+  stopped fixed loop stays stopped across a resume. Only the active branch is
+  reconstructed, so an abandoned branch's tasks do not leak back in. If a branch
+  contains an entry this version cannot read (a malformed entry, or one written
+  by a newer schema version), the whole branch fails closed and nothing is
+  restored: an unreadable entry might be a tombstone, and restoring around it
+  could resurrect a deleted task. Tasks do not run while Pi is closed: missed
+  fixed boundaries resume on the grid and a missed one-shot is dropped.
 - **Stopping does not abort work already running.** It prevents future loop
   messages only.
 - **Minimum cadence is 1 minute.** Fixed intervals must be positive whole
@@ -279,9 +292,10 @@ The logic is split so it can be tested without Pi:
 | `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, injected clock and dispatch). |
 | `src/due-queue.ts` | Scheduler-owned per-task due queue: coalesces repeated misses and defines the deterministic flush order (earliest missed deadline, ties by registration). |
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps) and `nextFireAt` boundary calculation. |
-| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/list/get/delete, active-task limit, stored schedules, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
+| `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, optional expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
+| `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
 | `src/index.ts` | Pi wiring: command, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
@@ -302,7 +316,14 @@ forms, and per-run prompt resolution on the scheduler. Dispatch coverage adds
 plain text, literal slash text, skill/template expansion, rejected control and
 unknown-skill forms (at start and on a maintenance run), and cross-checks the
 policy against the installed Pi package's real built-in command list and
-`expandPromptTemplate`.
+`expandPromptTemplate`. Persistence coverage adds schema round-trips and
+malformed/newer-version rejection, create/update/delete replay with delete
+tombstones, divergent branches, fail-closed branches that prevent an unreadable
+newer-version or malformed mutation from resurrecting a deleted task, expired
+recurring tasks, missed one-shots, self-paced exclusion, scheduler
+create/update/delete emission, expiry and one-shot teardown, and an
+extension-level reload/resume that preserves stable IDs without duplicate timers
+or entries.
 
 ### Live smoke test
 
@@ -348,5 +369,7 @@ stream shows `extension_ui_request` notifications for the loop and a
 - **A task beginning with `stop`/`status` is treated as a command.** Only the
   exact words `stop` and `status` are commands; longer text such as
   `stop the build server` is a task.
-- **The loop did not survive a restart.** This is intended; loops are per-session
-  and in-memory only.
+- **A self-paced loop did not survive a restart.** This is intended; self-paced
+  wakeup state is ephemeral. Fixed loops and one-shot tasks are rebuilt from the
+  session with the same ID, unless they were stopped, expired, or missed (a
+  one-shot).

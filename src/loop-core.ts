@@ -9,6 +9,13 @@
  */
 import { DueQueue } from "./due-queue.ts";
 import {
+  createTaskEvent,
+  deleteTaskEvent,
+  updateTaskEvent,
+  type PersistedEvent,
+  type PersistedTask,
+} from "./persistence.ts";
+import {
   createSchedule,
   DAY_MS,
   HOUR_MS,
@@ -16,7 +23,7 @@ import {
   nextFireAt,
   type FixedSchedule,
 } from "./schedule.ts";
-import type { ScheduledTask, TaskMode, TaskRegistry } from "./task-registry.ts";
+import type { RestoredTask, ScheduledTask, TaskMode, TaskRegistry, TaskUpdate } from "./task-registry.ts";
 
 /** Minimum accepted parse-time interval. Sub-minute values normalize at scheduling. */
 export const MIN_INTERVAL_MS = 1_000;
@@ -375,6 +382,8 @@ export interface WakeupDecision {
 export interface StartOptions {
   /** Mark a maintenance loop, whose prompt is re-resolved on every run. */
   maintenance?: boolean;
+  /** Optional absolute time after which the task must not run or be restored. */
+  expiresAt?: number;
 }
 
 /** Options accepted when starting a self-paced loop. */
@@ -512,6 +521,8 @@ export class LoopScheduler implements WakeupService {
   private disposed = false;
   private nextSeq = 0;
   private nextToken = 1;
+  /** Greater than zero while replaying persisted state, when events are suppressed. */
+  private restoreDepth = 0;
 
   constructor(
     private readonly deps: SchedulerDeps,
@@ -525,6 +536,13 @@ export class LoopScheduler implements WakeupService {
      * task's stored prompt.
      */
     private readonly resolvePrompt: (task: ScheduledTask) => string = (task) => task.prompt,
+    /**
+     * Sink for persisted fixed/one-shot mutations. Called on create, metadata
+     * update, and delete (including expiry), but never for self-paced wakeups and
+     * never while replaying persisted state. A sink failure is reported and does
+     * not disturb scheduling.
+     */
+    private readonly persistEvent?: (event: PersistedEvent) => void,
   ) {}
 
   start(intervalMs: number, task: string, options: StartOptions = {}): void {
@@ -542,10 +560,12 @@ export class LoopScheduler implements WakeupService {
       ...(options.maintenance ? { maintenance: true } : {}),
       schedule,
       nextFireAt: nextFireAt(schedule, this.deps.now()),
+      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
     });
     const entry = this.track(created);
     this.primaryId = created.id;
     this.primarySchedule = schedule;
+    this.persistCreate(created);
     this.arm(entry, created);
   }
 
@@ -568,10 +588,133 @@ export class LoopScheduler implements WakeupService {
       ...(options.maintenance ? { maintenance: true } : {}),
       schedule,
       nextFireAt: nextFireAt(schedule, this.deps.now()),
+      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
     });
     const entry = this.track(created);
+    this.persistCreate(created);
     this.arm(entry, created);
     return created;
+  }
+
+  /**
+   * Schedule a one-shot task that runs once at `at` and then removes itself.
+   *
+   * One-shot tasks share the due queue, coalescing, and persistence with fixed
+   * tasks. A missed one-shot (its fire time passed while the session was closed)
+   * is not restored.
+   */
+  scheduleOnce(at: number, task: string, options: StartOptions = {}): ScheduledTask {
+    this.assertUsable();
+    if (!task.trim()) {
+      throw new Error("task must not be empty");
+    }
+    if (!Number.isFinite(at)) {
+      throw new Error("one-shot time must be a finite epoch time");
+    }
+    const created = this.registry.create({
+      prompt: task,
+      mode: "one-shot",
+      ...(options.maintenance ? { maintenance: true } : {}),
+      nextFireAt: at,
+      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+    });
+    const entry = this.track(created);
+    this.persistCreate(created);
+    this.armAtTime(entry, at);
+    return created;
+  }
+
+  /**
+   * Rebuild a persisted fixed or one-shot task under its original stable ID.
+   *
+   * Restoring a task does not emit persistence events, so replaying a branch on
+   * session start cannot write duplicate entries. A task whose ID is already
+   * tracked is left untouched, so a duplicate replay cannot arm a second timer.
+   * Self-paced tasks are never restored. Returns the task, or `undefined` when it
+   * could not be restored.
+   */
+  restore(input: PersistedTask): ScheduledTask | undefined {
+    this.assertUsable();
+    if (input.mode === "self-paced") {
+      return undefined;
+    }
+    const existing = this.registry.get(input.id);
+    if (existing) {
+      return existing;
+    }
+    this.restoreDepth += 1;
+    try {
+      let task: ScheduledTask;
+      try {
+        const restored: RestoredTask = {
+          id: input.id,
+          prompt: input.prompt,
+          mode: input.mode,
+          ...(input.maintenance ? { maintenance: true } : {}),
+          createdAt: input.createdAt,
+          ...(input.schedule === undefined ? {} : { schedule: input.schedule }),
+          ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
+          ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
+        };
+        task = this.registry.restore(restored);
+      } catch (error) {
+        this.onError?.(error);
+        return undefined;
+      }
+      const entry = this.track(task);
+      if (input.primary) {
+        this.primaryId = task.id;
+        this.primarySchedule = task.schedule;
+      }
+      if (task.mode === "one-shot") {
+        this.armAtTime(entry, task.nextFireAt ?? this.deps.now());
+      } else {
+        this.arm(entry, task);
+      }
+      return task;
+    } finally {
+      this.restoreDepth -= 1;
+    }
+  }
+
+  /**
+   * Apply a partial update to a tracked task and re-arm its timer when its
+   * timing changed. Persists an update event for fixed and one-shot tasks; a
+   * self-paced task's wakeup state is never persisted.
+   */
+  updateTask(id: string, update: TaskUpdate): ScheduledTask {
+    this.assertUsable();
+    const updated = this.registry.update(id, update);
+    const entry = this.entries.get(id);
+    if (!entry) {
+      return updated;
+    }
+    if (updated.mode === "self-paced") {
+      if (update.nextFireAt !== undefined) {
+        this.armSelfPaced(entry, updated);
+      }
+      return updated;
+    }
+    if (update.schedule !== undefined || update.nextFireAt !== undefined || update.expiresAt !== undefined) {
+      if (updated.mode === "one-shot") {
+        this.armAtTime(entry, updated.nextFireAt ?? this.deps.now());
+      } else {
+        this.arm(entry, updated);
+      }
+    }
+    // Re-arming may have expired and removed the task; do not persist a stale update.
+    if (!this.entries.has(id)) {
+      return updated;
+    }
+    const patch: Parameters<typeof updateTaskEvent>[1] = {};
+    if (update.prompt !== undefined) patch.prompt = updated.prompt;
+    if (update.schedule !== undefined && updated.schedule !== undefined) patch.schedule = { ...updated.schedule };
+    if (update.nextFireAt !== undefined && updated.nextFireAt !== undefined) patch.nextFireAt = updated.nextFireAt;
+    if (update.expiresAt !== undefined && updated.expiresAt !== null) patch.expiresAt = updated.expiresAt;
+    if (Object.keys(patch).length > 0) {
+      this.persist(updateTaskEvent(id, patch));
+    }
+    return updated;
   }
 
   /**
@@ -661,7 +804,8 @@ export class LoopScheduler implements WakeupService {
   /**
    * Cancel the command-owned loop. Returns whether one was running. Idempotent;
    * independently scheduled tasks are unaffected (use {@link stopTask} or
-   * {@link stopAll}).
+   * {@link stopAll}). A deleted fixed task is persisted as a tombstone so the
+   * stop survives a session reload.
    */
   stop(): boolean {
     const id = this.primaryId;
@@ -676,26 +820,35 @@ export class LoopScheduler implements WakeupService {
   /**
    * Stop one tracked task: cancel its timer, drop it from the due queue, and
    * remove it from the registry. Returns whether it was tracked.
+   *
+   * By default a fixed or one-shot task is also persisted as a delete tombstone.
+   * Pass `{ persist: false }` for lifecycle teardown (session shutdown, branch
+   * reconstruction) where the task should be restored later.
    */
-  stopTask(id: string): boolean {
+  stopTask(id: string, options: { persist?: boolean } = {}): boolean {
     const entry = this.entries.get(id);
     if (!entry) {
       return false;
     }
+    const task = this.registry.get(id);
     this.removeEntry(entry);
     if (this.registry.has(id)) {
       this.registry.delete(id);
     }
+    if (options.persist !== false && task && task.mode !== "self-paced") {
+      this.persist(deleteTaskEvent(id));
+    }
     return true;
   }
 
-  /** Stop every tracked task and clear the due queue. Keeps the scheduler usable. */
+  /**
+   * Stop every tracked task and clear the due queue. Keeps the scheduler usable.
+   * Does not persist deletes: teardown must not tombstone tasks that a later
+   * reload should restore.
+   */
   stopAll(): void {
     for (const entry of [...this.entries.values()]) {
-      this.removeEntry(entry);
-      if (this.registry.has(entry.id)) {
-        this.registry.delete(entry.id);
-      }
+      this.stopTask(entry.id, { persist: false });
     }
     this.due.clear();
     this.primaryId = undefined;
@@ -830,7 +983,8 @@ export class LoopScheduler implements WakeupService {
   /**
    * Arm a timer for the task's next boundary. The boundary is taken from the
    * stored schedule, so arming late (after a slow tick or a clock jump) skips
-   * missed boundaries instead of shifting the schedule.
+   * missed boundaries instead of shifting the schedule. A task whose next
+   * boundary is past its expiry is removed instead of armed.
    */
   private arm(entry: TrackedTask, task: ScheduledTask): void {
     if (this.entries.get(entry.id) !== entry) {
@@ -844,6 +998,11 @@ export class LoopScheduler implements WakeupService {
     const now = this.deps.now();
     const due =
       task.nextFireAt !== undefined && task.nextFireAt > now ? task.nextFireAt : nextFireAt(schedule, now);
+    const expiresAt = this.registry.get(entry.id)?.expiresAt ?? task.expiresAt;
+    if (expiresAt !== undefined && (expiresAt <= now || due > expiresAt)) {
+      this.stopTask(entry.id, { persist: this.restoreDepth === 0 });
+      return;
+    }
     if (due !== task.nextFireAt) {
       this.registry.update(entry.id, { nextFireAt: due });
     }
@@ -859,10 +1018,16 @@ export class LoopScheduler implements WakeupService {
     if (!current || current.mode !== "self-paced") {
       return;
     }
+    this.armAtTime(entry, current.nextFireAt ?? this.deps.now());
+  }
+
+  /** Arm a timer to fire once at `due`, clamped so it never fires in the past. */
+  private armAtTime(entry: TrackedTask, due: number): void {
+    if (this.entries.get(entry.id) !== entry) {
+      return;
+    }
     this.clearTimer(entry);
-    const now = this.deps.now();
-    const due = current.nextFireAt ?? now;
-    this.armTimer(entry, Math.max(0, due - now));
+    this.armTimer(entry, Math.max(0, due - this.deps.now()));
   }
 
   private armTimer(entry: TrackedTask, delayMs: number): void {
@@ -885,6 +1050,16 @@ export class LoopScheduler implements WakeupService {
     }
     if (task.mode === "self-paced") {
       this.onSelfPacedTick(entry, task);
+      return;
+    }
+    if (task.mode === "one-shot") {
+      // A one-shot either fires once now or is queued for the next idle moment;
+      // it is never re-armed.
+      if (this.isIdle()) {
+        this.deliverFixed(entry, task);
+      } else {
+        this.markDue(entry, task.nextFireAt ?? this.deps.now());
+      }
       return;
     }
     if (!task.schedule) {
@@ -943,8 +1118,9 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * Deliver a due fixed run: resolve its prompt, clear its queued state, and
-   * dispatch. Returns whether a dispatch was attempted.
+   * Deliver a due fixed or one-shot run: resolve its prompt, clear its queued
+   * state, and dispatch. Returns whether a dispatch was attempted. A one-shot is
+   * removed after it fires (or fails to resolve) so it never repeats.
    *
    * A prompt that cannot be resolved is reported and this run is skipped; the
    * schedule has already advanced, so the next boundary retries without
@@ -961,9 +1137,15 @@ export class LoopScheduler implements WakeupService {
       prompt = this.resolvePrompt(updated);
     } catch (error) {
       this.onError?.(error);
+      if (updated.mode === "one-shot") {
+        this.stopTask(entry.id);
+      }
       return false;
     }
     this.safeDispatch(updated, prompt, entry);
+    if (updated.mode === "one-shot") {
+      this.stopTask(entry.id);
+    }
     return true;
   }
 
@@ -1072,5 +1254,48 @@ export class LoopScheduler implements WakeupService {
       this.deps.clearTimer(entry.timer);
       entry.timer = null;
     }
+  }
+
+  /**
+   * Persist one mutation. Suppressed while replaying persisted state so a reload
+   * cannot append duplicate events. A failing sink is reported through `onError`
+   * and never interrupts scheduling.
+   */
+  private persist(event: PersistedEvent): void {
+    if (this.restoreDepth > 0 || !this.persistEvent) {
+      return;
+    }
+    try {
+      this.persistEvent(event);
+    } catch (error) {
+      this.onError?.(error);
+    }
+  }
+
+  private persistCreate(task: ScheduledTask): void {
+    const snapshot = this.snapshot(task);
+    if (snapshot) {
+      this.persist(createTaskEvent(snapshot));
+    }
+  }
+
+  /** Build the persisted view of a task, or `undefined` for an ephemeral one. */
+  private snapshot(task: ScheduledTask): PersistedTask | undefined {
+    if (task.mode === "self-paced") {
+      return undefined;
+    }
+    return {
+      id: task.id,
+      prompt: task.prompt,
+      mode: task.mode,
+      ...(task.maintenance ? { maintenance: true } : {}),
+      ...(this.primaryId === task.id ? { primary: true } : {}),
+      createdAt: task.createdAt,
+      ...(task.schedule === undefined
+        ? {}
+        : { schedule: { intervalMs: task.schedule.intervalMs, anchor: task.schedule.anchor } }),
+      ...(task.nextFireAt === undefined ? {} : { nextFireAt: task.nextFireAt }),
+      ...(task.expiresAt === undefined ? {} : { expiresAt: task.expiresAt }),
+    };
   }
 }

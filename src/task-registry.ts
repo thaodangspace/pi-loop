@@ -41,6 +41,12 @@ export interface ScheduledTask {
   readonly schedule?: FixedSchedule;
   /** When the task is next due, if a schedule has been computed yet. */
   readonly nextFireAt?: number;
+  /**
+   * Optional absolute time after which the task must neither run nor be restored.
+   * Recurring tasks stop at the last boundary before it; one-shot tasks are
+   * dropped once missed.
+   */
+  readonly expiresAt?: number;
   /** True when a run was missed while busy and is queued for the next idle moment. */
   readonly pending: boolean;
   /**
@@ -58,7 +64,24 @@ export interface NewTask {
   maintenance?: boolean;
   schedule?: FixedSchedule;
   nextFireAt?: number;
+  expiresAt?: number;
   reason?: string;
+}
+
+/**
+ * A task reconstructed from persisted session state. Unlike {@link NewTask} it
+ * carries an explicit stable ID and creation time, so restore keeps both exactly
+ * as they were before the session was reloaded.
+ */
+export interface RestoredTask {
+  id: string;
+  prompt: string;
+  mode: TaskMode;
+  maintenance?: boolean;
+  createdAt: number;
+  schedule?: FixedSchedule;
+  nextFireAt?: number;
+  expiresAt?: number;
 }
 
 /**
@@ -70,6 +93,8 @@ export interface TaskUpdate {
   pending?: boolean;
   schedule?: FixedSchedule | null;
   nextFireAt?: number | null;
+  /** Expiry time; pass `null` to clear it, or omit it to keep the current value. */
+  expiresAt?: number | null;
   /** Wakeup reason; pass `null` to clear it, or omit it to keep the current value. */
   reason?: string | null;
 }
@@ -196,7 +221,53 @@ export class TaskRegistry {
       createdAt: this.now(),
       ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
       ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
+      ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
       ...(input.reason === undefined ? {} : { reason: input.reason }),
+      pending: false,
+    });
+    this.tasks.set(task.id, task);
+    return task;
+  }
+
+  /**
+   * Reconstruct a task from persisted state with its original ID and creation
+   * time. Used by session restore, so it deliberately does not allocate an ID or
+   * consult the clock. Throws if the ID is already registered so a duplicate
+   * replay cannot create a second task (and second timer) for the same ID.
+   */
+  restore(input: RestoredTask): ScheduledTask {
+    this.assertMutable();
+    assertPrompt(input.prompt);
+    if (typeof input.id !== "string" || input.id.length === 0) {
+      throw new TaskRegistryError("restored task id must be a non-empty string");
+    }
+    if (this.tasks.has(input.id)) {
+      throw new TaskRegistryError(`task id ${input.id} is already registered`);
+    }
+    if (input.mode === "fixed" && input.schedule === undefined) {
+      throw new TaskRegistryError(`restored fixed task ${input.id} has no schedule`);
+    }
+    if (
+      input.schedule !== undefined &&
+      (!Number.isFinite(input.schedule.intervalMs) || !Number.isFinite(input.schedule.anchor))
+    ) {
+      throw new TaskRegistryError(`restored task ${input.id} has an invalid schedule`);
+    }
+    if (input.mode === "one-shot" && input.nextFireAt === undefined) {
+      throw new TaskRegistryError(`restored one-shot task ${input.id} has no next fire time`);
+    }
+    if (this.tasks.size >= this.maxTasks) {
+      throw new TaskLimitError(`cannot schedule more than ${this.maxTasks} tasks`);
+    }
+    const task: ScheduledTask = Object.freeze({
+      id: input.id,
+      prompt: input.prompt,
+      mode: input.mode,
+      ...(input.maintenance ? { maintenance: true } : {}),
+      createdAt: input.createdAt,
+      ...(input.schedule === undefined ? {} : { schedule: freezeSchedule(input.schedule) }),
+      ...(input.nextFireAt === undefined ? {} : { nextFireAt: input.nextFireAt }),
+      ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
       pending: false,
     });
     this.tasks.set(task.id, task);
@@ -256,6 +327,12 @@ export class TaskRegistry {
           : freezeSchedule(update.schedule);
     const reason =
       update.reason === undefined ? current.reason : update.reason === null ? undefined : update.reason;
+    const expiresAt =
+      update.expiresAt === undefined
+        ? current.expiresAt
+        : update.expiresAt === null
+          ? undefined
+          : update.expiresAt;
     const next: ScheduledTask = Object.freeze({
       id: current.id,
       prompt: update.prompt ?? current.prompt,
@@ -265,6 +342,7 @@ export class TaskRegistry {
       pending: update.pending ?? current.pending,
       ...(schedule === undefined ? {} : { schedule }),
       ...(nextFireAt === undefined ? {} : { nextFireAt }),
+      ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(reason === undefined ? {} : { reason }),
     });
     this.tasks.set(id, next);
