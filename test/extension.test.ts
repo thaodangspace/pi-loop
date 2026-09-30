@@ -134,7 +134,7 @@ test("an invalid config reports an error and starts nothing", async () => {
   assert.match(ctx.lastNotification()?.message ?? "", /Loop config error/);
 
   await pi.run("loop", "status", ctx);
-  assert.equal(ctx.lastNotification()?.message, "No loop is running.");
+  assert.equal(ctx.lastNotification()?.message, "No scheduled tasks are active.");
   timers.advance(120_000);
   assert.deepEqual(pi.sent, []);
   assert.equal(timers.pendingCount, 0);
@@ -553,6 +553,278 @@ test("status reports a pending run and clears it after flush", async () => {
   pi.fire("agent_settled", ctx);
   await pi.run("loop", "status", ctx);
   assert.doesNotMatch(ctx.lastNotification()?.message ?? "", /queued/);
+});
+
+// ---------------------------------------------------------------------------
+// Multi-task /loop status and stop
+// ---------------------------------------------------------------------------
+
+test("/loop status shows every mixed-mode task exactly once with the primary marked", async () => {
+  const { pi, ctx, registry } = setup();
+
+  await pi.run("loop", "watch command", ctx);
+  const fixed = (await callTool(
+    pi,
+    "schedule_task",
+    { interval: "10min", prompt: "fixed task" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const once = (await callTool(
+    pi,
+    "schedule_once_task",
+    { delay: "30min", prompt: "once task" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const cmdId = registry.list().find((item) => item.mode === "self-paced")!.id;
+
+  await pi.run("loop", "status", ctx);
+  const message = ctx.lastNotification()?.message ?? "";
+  assert.match(message, /Self-paced loop: watch command/);
+  assert.match(message, /3 scheduled tasks:/);
+  for (const id of [cmdId, fixed.details.task.id, once.details.task.id]) {
+    assert.equal(message.split(id).length - 1, 1, `task ${id} appears exactly once`);
+  }
+  assert.match(message, new RegExp(`${cmdId} · \\[self-paced\\] · primary`));
+  assert.match(message, /fixed task/);
+  assert.match(message, /once task/);
+});
+
+test("/loop status lists the command-owned loop first regardless of creation order", async () => {
+  const { pi, ctx, registry } = setup();
+
+  // The independent task is created before the command loop, but the
+  // command-owned loop must still be listed first in deterministic order.
+  const independent = (await callTool(
+    pi,
+    "schedule_task",
+    { interval: "10min", prompt: "independent" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  await pi.run("loop", "every 5min command", ctx);
+  const cmdId = registry.list().find((item) => item.prompt === "command")!.id;
+
+  await pi.run("loop", "status", ctx);
+  const lines = (ctx.lastNotification()?.message ?? "").split("\n");
+  const cmdIndex = lines.findIndex((line) => line.startsWith(cmdId));
+  const independentIndex = lines.findIndex((line) => line.startsWith(independent.details.task.id));
+  assert.ok(cmdIndex > 0 && independentIndex > 0, "both tasks are listed");
+  assert.ok(cmdIndex < independentIndex, "the command-owned loop is listed first");
+});
+
+test("/loop stop <id> cancels only the named task and reports unknown IDs clearly", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await pi.run("loop", "every 5min command", ctx);
+  const tool = (await callTool(
+    pi,
+    "schedule_task",
+    { interval: "10min", prompt: "tool task" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const toolId = tool.details.task.id;
+  const cmdId = registry.list().find((item) => item.prompt === "command")!.id;
+
+  // An unknown ID mutates nothing.
+  await pi.run("loop", "stop zzzz9999", ctx);
+  assert.equal(ctx.lastNotification()?.type, "warning");
+  assert.match(ctx.lastNotification()?.message ?? "", /No scheduled task with ID "zzzz9999"/);
+  assert.equal(registry.has(toolId), true);
+  assert.equal(registry.has(cmdId), true);
+
+  // A targeted stop removes exactly that task, not the command-owned loop.
+  await pi.run("loop", `stop ${toolId}`, ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", new RegExp(`Stopped scheduled task ${toolId}`));
+  assert.equal(registry.has(toolId), false);
+  assert.equal(registry.has(cmdId), true, "the command-owned loop survives");
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Loop every 5min: command/);
+  await pi.run("loop", "stop", ctx);
+  assert.equal(ctx.lastNotification()?.message, "Loop stopped.");
+  assert.equal(registry.size, 0);
+  assert.equal(timers.pendingCount, 0);
+});
+
+test("/loop stop <primary-id> clears primary bookkeeping and leaves independent tasks", async () => {
+  const { pi, ctx, registry } = setup();
+
+  await pi.run("loop", "every 5min command", ctx);
+  const cmdId = registry.list().find((item) => item.prompt === "command")!.id;
+  const tool = (await callTool(
+    pi,
+    "schedule_task",
+    { interval: "10min", prompt: "independent" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const toolId = tool.details.task.id;
+
+  await pi.run("loop", `stop ${cmdId}`, ctx);
+  assert.match(
+    ctx.lastNotification()?.message ?? "",
+    new RegExp(`Stopped scheduled task ${cmdId} \\(command-owned loop\\)`),
+  );
+  assert.equal(registry.has(cmdId), false);
+  assert.equal(registry.has(toolId), true, "the independent task survives");
+
+  // Primary bookkeeping is cleared: a plain `/loop stop` finds no command loop…
+  await pi.run("loop", "stop", ctx);
+  assert.equal(ctx.lastNotification()?.message, "No loop is running.");
+  assert.equal(registry.has(toolId), true, "the second stop touches nothing else");
+
+  // …and status no longer marks any task as primary.
+  await pi.run("loop", "status", ctx);
+  const status = ctx.lastNotification()?.message ?? "";
+  assert.doesNotMatch(status, /primary/);
+  assert.match(status, new RegExp(toolId));
+});
+
+test("/loop status <id> shows one task in detail and rejects an unknown ID", async () => {
+  const { pi, ctx, registry } = setup();
+
+  await pi.run("loop", "every 5min command", ctx);
+  const cmdId = registry.list()[0]!.id;
+  const tool = (await callTool(
+    pi,
+    "schedule_task",
+    { interval: "10min", prompt: "tool task" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const toolId = tool.details.task.id;
+
+  await pi.run("loop", `status ${toolId}`, ctx);
+  const detail = ctx.lastNotification()?.message ?? "";
+  assert.match(detail, new RegExp(`^Task ${toolId} · \\[fixed\\]`));
+  assert.match(detail, /Schedule: every 10min/);
+  assert.match(detail, /Status: scheduled/);
+  assert.match(detail, /Prompt: tool task/);
+  assert.doesNotMatch(detail, /primary/, "an independent task is not marked primary");
+
+  await pi.run("loop", `status ${cmdId}`, ctx);
+  assert.match(
+    ctx.lastNotification()?.message ?? "",
+    new RegExp(`^Task ${cmdId} \\(command-owned\\) · \\[fixed\\]`),
+  );
+
+  await pi.run("loop", "status zzzz9999", ctx);
+  assert.equal(ctx.lastNotification()?.type, "warning");
+  assert.match(ctx.lastNotification()?.message ?? "", /No scheduled task with ID "zzzz9999"/);
+
+  assert.equal(registry.has(cmdId), true);
+  assert.equal(registry.has(toolId), true);
+  assert.deepEqual(pi.sent, [], "detail is read-only");
+});
+
+test("/loop status <unknown-id> reports the unknown ID even with no tasks", async () => {
+  const { pi, ctx, registry } = setup();
+
+  assert.equal(registry.size, 0, "no scheduled tasks are active");
+  await pi.run("loop", "status stale123", ctx);
+  assert.equal(ctx.lastNotification()?.type, "warning");
+  assert.equal(
+    ctx.lastNotification()?.message,
+    'No scheduled task with ID "stale123".',
+    "a stale/unknown ID is reported as such, not as a generic empty registry",
+  );
+
+  // A plain status on the empty registry still reports the aggregate message.
+  await pi.run("loop", "status", ctx);
+  assert.equal(ctx.lastNotification()?.type, "info");
+  assert.equal(ctx.lastNotification()?.message, "No scheduled tasks are active.");
+  assert.equal(registry.size, 0, "reporting an unknown ID mutates nothing");
+});
+
+test("session reconstruction never leaves a stale primary in status", async () => {
+  const { pi } = setup();
+
+  const primaryBranch = [
+    {
+      type: "custom",
+      customType: PERSISTENCE_CUSTOM_TYPE,
+      data: createTaskEvent({
+        id: "t1",
+        prompt: "command",
+        mode: "fixed",
+        primary: true,
+        createdAt: 0,
+        schedule: { intervalMs: 300_000, anchor: 0 },
+        nextFireAt: 300_000,
+      }),
+    },
+  ];
+  const independentBranch = [
+    {
+      type: "custom",
+      customType: PERSISTENCE_CUSTOM_TYPE,
+      data: createTaskEvent({
+        id: "t2",
+        prompt: "independent",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: { intervalMs: 600_000, anchor: 0 },
+        nextFireAt: 600_000,
+      }),
+    },
+  ];
+
+  const first = new FakeCtx();
+  first.branch = primaryBranch;
+  pi.fire("session_start", first);
+  await pi.run("loop", "status", first);
+  assert.match(first.lastNotification()?.message ?? "", /Loop every 5min: command/);
+  assert.match(first.lastNotification()?.message ?? "", /primary/);
+
+  // Navigating to a branch with the independent task but no command loop must
+  // drop the previous primary entirely.
+  const nav = new FakeCtx();
+  nav.branch = independentBranch;
+  pi.fire("session_tree", nav);
+  await pi.run("loop", "status", nav);
+  const status = nav.lastNotification()?.message ?? "";
+  assert.match(status, /1 scheduled task:/);
+  assert.match(status, /t2 · \[fixed\] · every 10min/);
+  assert.doesNotMatch(status, /Loop every 5min: command/);
+  assert.doesNotMatch(status, /primary/);
+
+  await pi.run("loop", "stop", nav);
+  assert.equal(nav.lastNotification()?.message, "No loop is running.");
+});
+
+test("/loop status shows multiple independent self-paced tasks individually", async () => {
+  const { pi, ctx, registry } = setup();
+
+  await pi.run("loop", "command paced", ctx);
+  const a = (await callTool(
+    pi,
+    "schedule_self_paced_task",
+    { prompt: "paced A" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const b = (await callTool(
+    pi,
+    "schedule_self_paced_task",
+    { prompt: "paced B" },
+    ctx,
+  )) as { details: { task: { id: string } } };
+  const cmdId = registry.list().find((item) => item.prompt === "command paced")!.id;
+
+  assert.equal(registry.size, 3, "each self-paced task is independent");
+  for (const item of [a, b]) {
+    assert.equal(registry.get(item.details.task.id)?.mode, "self-paced");
+  }
+
+  await pi.run("loop", "status", ctx);
+  const message = ctx.lastNotification()?.message ?? "";
+  assert.match(message, /3 scheduled tasks:/);
+  for (const id of [cmdId, a.details.task.id, b.details.task.id]) {
+    assert.equal(message.split(id).length - 1, 1, `self-paced task ${id} appears exactly once`);
+  }
+  assert.match(message, /command paced/);
+  assert.match(message, /paced A/);
+  assert.match(message, /paced B/);
+
+  // The command-owned self-paced loop is marked; the independent ones are not.
+  assert.match(message, new RegExp(`${cmdId} · \\[self-paced\\] · primary`));
+  assert.match(message, new RegExp(`${a.details.task.id} · \\[self-paced\\] · next`));
 });
 
 // ---------------------------------------------------------------------------

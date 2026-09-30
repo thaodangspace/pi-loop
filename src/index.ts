@@ -34,7 +34,13 @@ import {
 } from "./maintenance.ts";
 import { collectEntries, PERSISTENCE_CUSTOM_TYPE, planRestore } from "./persistence.ts";
 import { jitterOffsetMs } from "./schedule.ts";
-import { formatStatusLine, formatTaskLines } from "./status.ts";
+import {
+  formatStatusLine,
+  formatTaskDetail,
+  formatTaskLines,
+  orderStatusTasks,
+  summarizePrompt,
+} from "./status.ts";
 import { LoopServiceInputError, type EventBusLike, type LoopTaskSummary } from "./service.ts";
 import {
   createLoopServiceProvider,
@@ -133,7 +139,12 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     }
     const now = timers.now();
     ctx.ui.setStatus(STATUS_KEY, formatStatusLine(tasks));
-    ctx.ui.setWidget(STATUS_KEY, formatTaskLines(tasks, now), { placement: "belowEditor" });
+    const primaryId = scheduler.primaryTaskId();
+    ctx.ui.setWidget(
+      STATUS_KEY,
+      formatTaskLines(orderStatusTasks(tasks, primaryId), now, primaryId),
+      { placement: "belowEditor" },
+    );
   };
 
   afterTimerFire = () => refreshUi();
@@ -356,14 +367,31 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   };
 
   /**
-   * Show the command-owned loop (when one is active) followed by every tracked
-   * task, so independent tool-created tasks are visible with their IDs, modes,
-   * next due/wakeup, and queued state.
+   * Show the command-owned loop summary (when one is active) followed by every
+   * tracked task in a deterministic order — the command-owned loop first, then
+   * the rest in creation order — so independent tasks are individually visible
+   * with their IDs, modes, next due/wakeup, and queued state. A task ID shows
+   * full detail for exactly that task instead.
    */
-  const describe = (ctx: ExtensionCommandContext): void => {
+  const describe = (ctx: ExtensionCommandContext, id?: string): void => {
     const tasks = registry.list();
+    const primaryId = scheduler.primaryTaskId();
+    // A targeted lookup is handled before the empty-registry case: an unknown or
+    // stale ID must be reported as such, not as a generic "no tasks" message.
+    if (id !== undefined) {
+      const task = registry.get(id);
+      if (!task) {
+        ctx.ui.notify(`No scheduled task with ID "${id}".`, "warning");
+        return;
+      }
+      ctx.ui.notify(
+        formatTaskDetail(task, timers.now(), { primary: task.id === primaryId }),
+        "info",
+      );
+      return;
+    }
     if (tasks.length === 0) {
-      ctx.ui.notify("No loop is running.", "info");
+      ctx.ui.notify("No scheduled tasks are active.", "info");
       return;
     }
     const lines: string[] = [];
@@ -372,7 +400,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       lines.push(primary);
     }
     lines.push(`${tasks.length} scheduled task${tasks.length === 1 ? "" : "s"}:`);
-    lines.push(...formatTaskLines(tasks, timers.now()));
+    lines.push(...formatTaskLines(orderStatusTasks(tasks, primaryId), timers.now(), primaryId));
     ctx.ui.notify(lines.join("\n"), "info");
   };
 
@@ -428,13 +456,29 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
           ctx.ui.notify(usageText(command.reason), "warning");
           return;
         case "stop": {
+          if (command.id !== undefined) {
+            const task = registry.get(command.id);
+            if (!task) {
+              ctx.ui.notify(`No scheduled task with ID "${command.id}".`, "warning");
+              return;
+            }
+            const wasPrimary = command.id === scheduler.primaryTaskId();
+            scheduler.stopTask(command.id);
+            const role = wasPrimary ? " (command-owned loop)" : "";
+            ctx.ui.notify(
+              `Stopped scheduled task ${task.id}${role}: ${summarizePrompt(task.prompt)}`,
+              "info",
+            );
+            refreshUi(ctx);
+            return;
+          }
           const stopped = scheduler.stopCommandLoop();
           ctx.ui.notify(stopped ? "Loop stopped." : "No loop is running.", "info");
           refreshUi(ctx);
           return;
         }
         case "status":
-          describe(ctx);
+          describe(ctx, command.id);
           return;
         case "maintenance": {
           // Bare `/loop` and interval-only `/loop <n><unit>` run the maintenance

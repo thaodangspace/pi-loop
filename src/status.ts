@@ -23,6 +23,15 @@ import type { ScheduledTask } from "./task-registry.ts";
 /** Longest prompt fragment shown in a status line before it is elided. */
 export const STATUS_PROMPT_LIMIT = 72;
 
+/** Longest prompt fragment shown in full task detail before it is elided. */
+export const STATUS_DETAIL_PROMPT_LIMIT = 200;
+
+/** Whether a rendered task is the command-owned `/loop` loop. */
+export interface TaskLineOptions {
+  /** True when this task is the command-owned loop, marked distinctly in output. */
+  readonly primary?: boolean;
+}
+
 /** Collapse whitespace and bound a prompt so a status line stays one line. */
 export function summarizePrompt(prompt: string, limit = STATUS_PROMPT_LIMIT): string {
   const collapsed = prompt.replace(/\s+/g, " ").trim();
@@ -73,11 +82,18 @@ export function formatTaskSchedule(mode: ScheduledTask["mode"], schedule?: TaskS
 }
 
 /**
- * One task as a single status line: ID, mode, schedule, next due/wakeup, queued
+ * One task as a single status line: ID, mode, a `primary` marker for the
+ * command-owned loop, a `maintenance` marker, schedule, next due/wakeup, queued
  * state, then a bounded prompt preview.
  */
-export function formatTaskLine(task: ScheduledTask, now: number): string {
+export function formatTaskLine(task: ScheduledTask, now: number, options: TaskLineOptions = {}): string {
   const segments = [task.id, `[${task.mode}]`];
+  if (options.primary) {
+    segments.push("primary");
+  }
+  if (task.maintenance) {
+    segments.push("maintenance");
+  }
   const schedule = formatTaskSchedule(task.mode, task.schedule);
   if (schedule !== undefined) {
     segments.push(schedule);
@@ -91,9 +107,70 @@ export function formatTaskLine(task: ScheduledTask, now: number): string {
   return `${segments.join(" · ")}: ${summarizePrompt(task.prompt)}`;
 }
 
-/** Every task as a status line, in registry (creation) order. */
-export function formatTaskLines(tasks: readonly ScheduledTask[], now: number): string[] {
-  return tasks.map((task) => formatTaskLine(task, now));
+/**
+ * Every task as a status line, marking the command-owned loop when `primaryId`
+ * matches. Order is the caller's; see {@link orderStatusTasks} for the
+ * deterministic `/loop status` order.
+ */
+export function formatTaskLines(
+  tasks: readonly ScheduledTask[],
+  now: number,
+  primaryId?: string,
+): string[] {
+  return tasks.map((task) => formatTaskLine(task, now, { primary: task.id === primaryId }));
+}
+
+/**
+ * Deterministic display order for `/loop status`: the command-owned loop first
+ * (when present), then the remaining tasks in registry (creation) order. Both
+ * inputs are stable across repeated calls, and a stale `primaryId` (its task no
+ * longer present) simply falls back to registry order.
+ */
+export function orderStatusTasks(
+  tasks: readonly ScheduledTask[],
+  primaryId?: string,
+): ScheduledTask[] {
+  if (primaryId === undefined) {
+    return [...tasks];
+  }
+  const primary = tasks.find((task) => task.id === primaryId);
+  if (primary === undefined) {
+    return [...tasks];
+  }
+  return [primary, ...tasks.filter((task) => task.id !== primaryId)];
+}
+
+/**
+ * Full, multi-line detail for one task, used by `/loop status <id>`. Shows the
+ * operational fields a human needs to identify and reason about a single task
+ * without exposing internal timer or sequence state.
+ */
+export function formatTaskDetail(
+  task: ScheduledTask,
+  now: number,
+  options: TaskLineOptions = {},
+): string {
+  const role = options.primary ? " (command-owned)" : "";
+  const markers = [task.mode, ...(task.maintenance ? ["maintenance"] : [])].join(" · ");
+  const lines: string[] = [`Task ${task.id}${role} · [${markers}]`];
+  const schedule =
+    formatTaskSchedule(task.mode, task.schedule) ??
+    (task.mode === "self-paced" ? "self-paced (each iteration chooses its next wakeup)" : task.mode);
+  lines.push(`Schedule: ${schedule}`);
+  if (task.nextFireAt !== undefined) {
+    lines.push(`Next run: ${formatCountdown(now, task.nextFireAt)}`);
+  }
+  lines.push(
+    `Status: ${task.pending ? "one run queued for the next idle moment" : "scheduled"}`,
+  );
+  if (task.expiresAt !== undefined) {
+    lines.push(`Expires: ${formatCountdown(now, task.expiresAt)}`);
+  }
+  if (task.reason !== undefined) {
+    lines.push(`Last reason: ${task.reason}`);
+  }
+  lines.push(`Prompt: ${summarizePrompt(task.prompt, STATUS_DETAIL_PROMPT_LIMIT)}`);
+  return lines.join("\n");
 }
 
 /**

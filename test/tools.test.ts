@@ -505,7 +505,7 @@ test("/loop status lists the command loop and every tool task with ID and mode",
   assert.match(message, /Loop every 5min: command/, "the command-owned summary is kept");
   assert.match(message, /2 scheduled tasks:/);
   assert.match(message, new RegExp(`${created.details.task.id} · \\[fixed\\] · every 10min`));
-  assert.match(message, /\[fixed\] · every 5min/);
+  assert.match(message, /\[fixed\] · primary · every 5min/);
   assert.match(message, /tool task/);
 
   // The tool mutation also refreshed the persistent widget.

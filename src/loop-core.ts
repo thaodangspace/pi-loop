@@ -115,12 +115,19 @@ export function formatInterval(ms: number): string {
   return `${ms / 1_000}s`;
 }
 
-/** A parsed `/loop` invocation. */
+/**
+ * A parsed `/loop` invocation.
+ *
+ * `stop` and `status` accept an optional stable task ID so a human can address
+ * one task among many: `/loop stop <id>` cancels exactly that task and
+ * `/loop status <id>` shows its detail. Without an ID, `stop` targets the
+ * command-owned loop and `status` summarizes every active task.
+ */
 export type LoopCommand =
   | { type: "start"; task: string; intervalMs?: number }
   | { type: "maintenance"; intervalMs?: number }
-  | { type: "stop" }
-  | { type: "status" }
+  | { type: "stop"; id?: string }
+  | { type: "status"; id?: string }
   | { type: "usage"; reason: string };
 
 function reasonOf(error: unknown): string {
@@ -245,12 +252,14 @@ export function parseLoopCommand(rawArgs: string): LoopCommand {
   if (!args) {
     return { type: "maintenance" };
   }
-  const keyword = args.toLowerCase();
-  if (keyword === "stop") {
-    return { type: "stop" };
-  }
-  if (keyword === "status") {
-    return { type: "status" };
+  // `stop`/`status` are exact commands, optionally followed by a single stable
+  // task ID (`stop t1`, `status t1`). A multi-word argument is not an ID, so it
+  // keeps the long-standing literal-task behavior (`stop the build server`).
+  const tokens = args.split(/\s+/);
+  const head = tokens[0]!.toLowerCase();
+  if (tokens.length <= 2 && (head === "stop" || head === "status")) {
+    const id = tokens[1];
+    return id === undefined ? { type: head } : { type: head, id };
   }
 
   // Pi compatibility alias: `every <interval> <prompt>`.
@@ -315,8 +324,10 @@ export function usageText(reason?: string): string {
     `/loop every <n><unit> <task>              Pi-compatible alias for the above\n` +
     `/loop                                      maintenance: built-in prompt, self-paced\n` +
     `/loop <n><unit>                           maintenance on a fixed schedule\n` +
-    `/loop stop                                 cancel the active loop\n` +
-    `/loop status                               show the active loop\n` +
+    `/loop stop                                 cancel the command-owned loop\n` +
+    `/loop stop <id>                            cancel one scheduled task by its stable ID\n` +
+    `/loop status                               show every scheduled task\n` +
+    `/loop status <id>                          show one scheduled task in detail\n` +
     `Maintenance loops use .claude/loop.md, then ~/.claude/loop.md, then the built-in prompt, resolved fresh each run.\n` +
     `Self-paced wakeup delays clamp to 1min-1h. Fixed intervals round to a cron cadence: seconds up to the next whole minute, and steps such as 7m or 90m to the nearest supported value.`
   );
@@ -1189,6 +1200,17 @@ export class LoopScheduler implements WakeupService {
   /** IDs of every currently due task, in flush order. */
   dueTaskIds(): string[] {
     return this.due.list().map((entry) => entry.id);
+  }
+
+  /**
+   * The stable ID of the command-owned `/loop` loop, or `undefined` when no
+   * command-owned loop is active (including after it was stopped by ID or
+   * dropped by a session restore). A read-only projection of the scheduler's
+   * primary bookkeeping for status rendering and tests; unlike {@link status}
+   * it exposes no timer or self-paced decision state.
+   */
+  primaryTaskId(): string | undefined {
+    return this.primaryEntry()?.id;
   }
 
   /** IDs of every task the scheduler is tracking, in registration order. */
