@@ -514,12 +514,12 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     parameters: StopWakeupParams,
     executionMode: "sequential",
     async execute(): Promise<AgentToolResult<StopWakeupResult>> {
-      const status = scheduler.status();
-      // The scheduler has no primary-only stop for a specific mode, so scope the
-      // tool to the active self-paced loop explicitly. Self-paced loops are only
-      // ever the command-owned primary task, so at most one exists.
-      const active = registry.list().find((task) => task.mode === "self-paced");
-      if (!status.active || status.mode !== "self-paced" || active === undefined) {
+      // Scope the tool to the self-paced iteration that is executing now (or the
+      // command-owned self-paced loop outside a run). Independent self-paced tasks
+      // are only stoppable while their own iteration is active, so this never
+      // cancels a different task by accident.
+      const active = scheduler.activeSelfPacedTask();
+      if (active === undefined) {
         throw new Error("no self-paced loop is running");
       }
       const stopped = scheduler.stop();
