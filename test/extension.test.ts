@@ -748,7 +748,7 @@ test("the disable switch does not restore persisted tasks", () => {
 
 test("enabling by default still registers tools and restores", () => {
   const { pi, registry } = setup({ disabled: false });
-  assert.equal(pi.tools.size, 7, "the seven scheduling tools are registered");
+  assert.equal(pi.tools.size, 8, "the eight scheduling tools are registered");
   const ctx = new FakeCtx();
   ctx.branch = [
     {

@@ -474,6 +474,36 @@ test("command stop is separate from iteration stop", () => {
   assert.equal(scheduler.stop(), false);
 });
 
+test("executingSelfPacedTask distinguishes an executing iteration from the command-owned loop", () => {
+  const { timers, registry, scheduler, dispatched, setIdle } = setup();
+  const cmd = scheduler.startSelfPaced("cmd");
+
+  // The command-owned loop exists, but no iteration has executed yet, so no
+  // iteration is "executing" — the distinction the tools rely on to fail closed.
+  assert.equal(scheduler.executingSelfPacedTask(), undefined);
+  assert.equal(scheduler.activeSelfPacedTask()?.id, cmd.id, "the backward-compatible target is the primary");
+
+  setIdle(false);
+  timers.advance(0);
+  setIdle(true);
+  assert.equal(scheduler.flush(), true);
+  assert.equal(scheduler.executingSelfPacedTask()?.id, cmd.id, "the executing iteration is the primary");
+
+  // Settling releases the binding: the primary survives but is no longer executing.
+  assert.deepEqual(scheduler.settleIteration(), { action: "fallback", delayMs: MINUTE_MS, nextFireAt: MINUTE_MS });
+  assert.equal(scheduler.executingSelfPacedTask(), undefined);
+  assert.equal(scheduler.activeSelfPacedTask()?.id, cmd.id);
+  assert.deepEqual(dispatched, ["cmd"]);
+
+  // An independent task's executing iteration is likewise reported, and a stale
+  // binding (its record removed mid-turn) reports nothing.
+  const ind = scheduler.scheduleSelfPaced("ind");
+  timers.advance(MINUTE_MS);
+  assert.equal(scheduler.executingSelfPacedTask()?.id, ind.id);
+  registry.delete(ind.id);
+  assert.equal(scheduler.executingSelfPacedTask(), undefined, "a stale binding reports no executing iteration");
+});
+
 test("command stop cancels the command loop whether or not an iteration is bound", () => {
   const { timers, registry, scheduler, setIdle } = setup();
   const ind = scheduler.scheduleSelfPaced("ind");

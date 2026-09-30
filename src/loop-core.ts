@@ -1167,6 +1167,23 @@ export class LoopScheduler implements WakeupService {
     return task?.mode === "self-paced" ? task : undefined;
   }
 
+  /**
+   * The self-paced task whose iteration is *currently executing*, or `undefined`
+   * when no self-paced iteration is active. Unlike
+   * {@link activeSelfPacedTask}, this never falls back to the command-owned
+   * loop, so a model-facing wakeup/stop operation can require an actually
+   * executing iteration and fail closed outside one (including when only a
+   * command-owned self-paced task exists).
+   *
+   * A binding whose registry task disappeared mid-turn is stale and resolves to
+   * `undefined` until {@link settleIteration} releases it at the turn boundary,
+   * so a late call can never retarget the command loop or another task.
+   */
+  executingSelfPacedTask(): ScheduledTask | undefined {
+    const entry = this.liveBoundEntry();
+    return entry === undefined ? undefined : this.registry.get(entry.id);
+  }
+
   private assertUsable(): void {
     if (this.disposed) {
       throw new Error("scheduler has been disposed");

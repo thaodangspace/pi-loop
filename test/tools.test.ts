@@ -68,6 +68,7 @@ test("every scheduler tool is registered with a distinct name and typed schema",
       NAMES.scheduleTask,
       NAMES.scheduleCronTask,
       NAMES.scheduleOnceTask,
+      NAMES.scheduleSelfPaced,
       NAMES.listTasks,
       NAMES.deleteTask,
       NAMES.scheduleWakeup,
@@ -109,6 +110,17 @@ test("every scheduler tool is registered with a distinct name and typed schema",
   );
   assert.deepEqual(
     [...((once.parameters as { required?: string[] }).required ?? [])],
+    ["prompt"],
+  );
+
+  const selfPaced = pi.tools.get(NAMES.scheduleSelfPaced)!;
+  assert.match(selfPaced.description, /^Mutating\./);
+  assert.deepEqual(
+    Object.keys((selfPaced.parameters as { properties: Record<string, unknown> }).properties).sort(),
+    ["fallbackDelay", "prompt"],
+  );
+  assert.deepEqual(
+    [...((selfPaced.parameters as { required?: string[] }).required ?? [])],
     ["prompt"],
   );
 
@@ -500,4 +512,253 @@ test("/loop status lists the command loop and every tool task with ID and mode",
   assert.match((ctx.lastWidget() ?? []).join("\n"), /tool task/);
   timers.advance(0);
   assert.deepEqual(pi.sent, [], "status is read-only");
+});
+
+test("schedule_self_paced_task creates independent tasks with distinct IDs and an immediate first run", async () => {
+  const { timers, pi, registry } = setup();
+
+  const a = await callTool<{ task: { id: string; mode: string; nextFireAt?: number } }>(
+    pi,
+    NAMES.scheduleSelfPaced,
+    { prompt: "A" },
+  );
+  const b = await callTool<{ task: { id: string; mode: string }; fallbackDelayMs: number }>(
+    pi,
+    NAMES.scheduleSelfPaced,
+    { prompt: "B", fallbackDelay: "5min" },
+  );
+
+  assert.equal(a.details.task.mode, "self-paced");
+  assert.equal(a.details.task.nextFireAt, timers.clock, "the first run is due immediately");
+  assert.notEqual(a.details.task.id, b.details.task.id, "each task gets a stable distinct ID");
+  assert.equal(b.details.fallbackDelayMs, 5 * 60_000);
+  assert.equal(registry.size, 2, "the second task never replaces the first");
+  assert.equal(timers.pendingCount, 2, "each task arms its own immediate timer");
+
+  const list = await callTool<{
+    count: number;
+    tasks: Array<{ id: string; mode: string; nextFireAt?: number }>;
+  }>(pi, NAMES.listTasks, {});
+  assert.equal(list.details.count, 2);
+  assert.deepEqual(
+    list.details.tasks.map((task) => task.id),
+    [a.details.task.id, b.details.task.id],
+    "creation order is preserved",
+  );
+  assert.deepEqual(list.details.tasks.map((task) => task.mode), ["self-paced", "self-paced"]);
+});
+
+test("two tool-created self-paced tasks run independently and schedule their own wakeups", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  const a = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleSelfPaced, { prompt: "A" });
+  const b = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleSelfPaced, { prompt: "B" });
+  const aId = a.details.task.id;
+  const bId = b.details.task.id;
+
+  // Both first runs are due at once; the earlier registration executes and the
+  // other is queued behind its turn.
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["A"]);
+  assert.equal(registry.get(bId)?.pending, true, "B waits for the next idle boundary");
+
+  const wakeA = await callTool<{ nextFireAt: number }>(
+    pi,
+    NAMES.scheduleWakeup,
+    { delayMs: 2 * 60_000, reason: "A later" },
+    ctx,
+  );
+  assert.equal(wakeA.details.nextFireAt, 2 * 60_000);
+  assert.equal(registry.get(aId)?.nextFireAt, 2 * 60_000);
+  assert.equal(registry.get(bId)?.nextFireAt, 0, "A's choice does not reschedule B");
+
+  // The settle boundary releases A and flushes the queued B.
+  pi.fire("agent_settled", ctx);
+  assert.deepEqual(pi.sent, ["A", "B"]);
+
+  const wakeB = await callTool<{ nextFireAt: number }>(
+    pi,
+    NAMES.scheduleWakeup,
+    { delayMs: 10 * 60_000, reason: "B later" },
+    ctx,
+  );
+  assert.equal(wakeB.details.nextFireAt, 10 * 60_000);
+  assert.equal(registry.get(aId)?.nextFireAt, 2 * 60_000, "B's choice does not move A");
+
+  // stop_wakeup ends only the iteration that invoked it; A survives untouched.
+  const stopped = await callTool<{ id: string; prompt: string }>(pi, NAMES.stopWakeup, {}, ctx);
+  assert.equal(stopped.details.id, bId);
+  assert.equal(stopped.details.prompt, "B");
+  assert.equal(registry.has(bId), false);
+  assert.equal(registry.has(aId), true);
+
+  // Release B's stale binding, then A's earlier wakeup still fires.
+  pi.fire("agent_settled", ctx);
+  timers.advance(2 * 60_000);
+  assert.deepEqual(pi.sent, ["A", "B", "A"], "A's own wakeup is honoured after B is stopped");
+});
+
+test("a tool-created self-paced task coexists with the command-owned /loop", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  await pi.run("loop", "command paced", ctx);
+  const tool = await callTool<{ task: { id: string } }>(
+    pi,
+    NAMES.scheduleSelfPaced,
+    { prompt: "tool paced" },
+    ctx,
+  );
+  assert.equal(registry.size, 2, "the tool task never replaces the command loop");
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /Self-paced loop: command paced/);
+  assert.match(ctx.lastNotification()?.message ?? "", /tool paced/);
+
+  // Both are due now; the command loop was registered first and runs, and the
+  // tool-created task is queued.
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["command paced"]);
+  assert.equal(registry.get(tool.details.task.id)?.pending, true);
+
+  // /loop stop cancels only the command-owned loop.
+  await pi.run("loop", "stop", ctx);
+  assert.equal(registry.has(tool.details.task.id), true, "the tool-created task survives");
+  assert.equal(registry.size, 1);
+});
+
+test("schedule_wakeup and stop_wakeup fail closed outside an executing iteration", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  // A command-owned self-paced loop exists, but its first iteration has not run.
+  await pi.run("loop", "watch deploy", ctx);
+  const id = registry.list()[0]!.id;
+  const nextFireAt = registry.get(id)?.nextFireAt;
+
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleWakeup, { delayMs: 60_000 }, ctx),
+    (error: unknown) => error instanceof WakeupError && /no self-paced loop/.test(error.message),
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.stopWakeup, {}, ctx),
+    (error: unknown) => error instanceof WakeupError && /no self-paced loop/.test(error.message),
+  );
+  assert.equal(registry.has(id), true, "the primary outside an iteration is untouched");
+  assert.equal(registry.get(id)?.nextFireAt, nextFireAt, "it is not rescheduled");
+
+  // Once the iteration executes, the tools are scoped to it.
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["watch deploy"]);
+  const stopped = await callTool<{ id: string }>(pi, NAMES.stopWakeup, {}, ctx);
+  assert.equal(stopped.details.id, id);
+  assert.equal(registry.has(id), false);
+});
+
+test("delete_scheduled_task cancels an independent self-paced task outside an iteration", async () => {
+  const { timers, pi, registry } = setup();
+  const a = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleSelfPaced, { prompt: "A" });
+  const b = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleSelfPaced, { prompt: "B" });
+
+  await callTool(pi, NAMES.deleteTask, { id: a.details.task.id });
+  assert.equal(registry.has(a.details.task.id), false);
+  assert.equal(registry.has(b.details.task.id), true, "the other self-paced task is untouched");
+  assert.equal(timers.pendingCount, 1, "only the deleted task's timer is cleared");
+
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["B"], "the deleted task never runs");
+});
+
+test("a tool-created self-paced fallback delay is validated and clamped like /loop", async () => {
+  const { timers, pi, ctx, registry } = setup();
+
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleSelfPaced, { prompt: "   " }),
+    /prompt must be a non-empty string/,
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleSelfPaced, { prompt: "/loop stop" }),
+    (error: unknown) => error instanceof ScheduledPromptRejectedError,
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleSelfPaced, { prompt: "ok", fallbackDelay: "5x" }),
+    (error: unknown) => error instanceof IntervalError && /unknown interval unit/.test(error.message),
+  );
+  assert.equal(registry.size, 0, "no invalid self-paced task is registered");
+  assert.equal(timers.pendingCount, 0, "no timer is armed for a rejected task");
+
+  const clampedUp = await callTool<{ fallbackDelayMs: number; fallbackClamped: boolean }>(
+    pi,
+    NAMES.scheduleSelfPaced,
+    { prompt: "short", fallbackDelay: "30s" },
+  );
+  assert.equal(clampedUp.details.fallbackDelayMs, 60_000, "below the floor clamps up to 1min");
+  assert.equal(clampedUp.details.fallbackClamped, true);
+
+  const clampedDown = await callTool<{ fallbackDelayMs: number; fallbackClamped: boolean }>(
+    pi,
+    NAMES.scheduleSelfPaced,
+    { prompt: "long", fallbackDelay: "2h" },
+  );
+  assert.equal(clampedDown.details.fallbackDelayMs, 60 * 60_000, "above the ceiling clamps down to 1h");
+  assert.equal(clampedDown.details.fallbackClamped, true);
+
+  // The clamp reaches the scheduler: the fallback granted after a missed choice
+  // uses the clamped delay, not the requested one.
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["short"], "the earlier registration runs first");
+  pi.fire("agent_settled", ctx);
+  assert.equal(
+    registry.get(registry.list()[0]!.id)?.nextFireAt,
+    timers.clock + 60_000,
+    "the 30s fallback is clamped up to 1min",
+  );
+});
+
+test("schedule_self_paced_task shares the active-task limit", async () => {
+  const { pi, registry } = setup({ registry: testRegistry(new FakeTimers(), { maxTasks: 1 }) });
+
+  await callTool(pi, NAMES.scheduleSelfPaced, { prompt: "first" });
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleSelfPaced, { prompt: "second" }),
+    (error: unknown) => error instanceof TaskLimitError,
+  );
+  assert.equal(registry.size, 1);
+});
+
+test("independent self-paced tasks coexist with fixed, cron, and one-shot tasks", async () => {
+  const { timers, pi, registry } = setup();
+  const fixed = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleTask, {
+    interval: "5min",
+    prompt: "fixed",
+  });
+  const cron = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleCronTask, {
+    cron: "*/5 * * * *",
+    prompt: "cron",
+    timeZone: "UTC",
+  });
+  const once = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleOnceTask, {
+    delay: "30min",
+    prompt: "once",
+  });
+  const paced = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleSelfPaced, {
+    prompt: "paced",
+  });
+
+  assert.equal(registry.size, 4);
+  const list = await callTool<{ tasks: Array<{ id: string; mode: string }> }>(pi, NAMES.listTasks, {});
+  assert.deepEqual(
+    list.details.tasks.map((task) => task.mode),
+    ["fixed", "fixed", "one-shot", "self-paced"],
+  );
+
+  // Only the self-paced task is due immediately; the others wait for a boundary.
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["paced"]);
+
+  // The self-paced task can be cancelled while the others stay scheduled.
+  await callTool(pi, NAMES.deleteTask, { id: paced.details.task.id });
+  assert.equal(registry.has(fixed.details.task.id), true);
+  assert.equal(registry.has(cron.details.task.id), true);
+  assert.equal(registry.has(once.details.task.id), true);
+
+  timers.advance(5 * 60_000);
+  assert.ok(pi.sent.includes("fixed"), "the fixed task still fires");
+  assert.ok(pi.sent.includes("cron"), "the cron task still fires");
 });
