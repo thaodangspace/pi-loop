@@ -35,6 +35,12 @@ import {
 import { collectEntries, PERSISTENCE_CUSTOM_TYPE, planRestore } from "./persistence.ts";
 import { jitterOffsetMs } from "./schedule.ts";
 import { formatStatusLine, formatTaskLines } from "./status.ts";
+import { LoopServiceInputError, type EventBusLike, type LoopTaskSummary } from "./service.ts";
+import {
+  createLoopServiceProvider,
+  summarizeTask,
+  type LoopServiceBackend,
+} from "./service-provider.ts";
 import { TaskRegistry, type ScheduledTask } from "./task-registry.ts";
 import { registerSchedulerTools } from "./tools.ts";
 
@@ -200,6 +206,101 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       classifyPrompt: (prompt) => dispatcher.classify(prompt),
       onChange: () => refreshUi(),
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Versioned extension-to-extension service (public boundary: `pi-loop/service`)
+  // ---------------------------------------------------------------------------
+  //
+  // A sibling extension discovers the service over `pi.events` and calls the same
+  // scheduler and registry as `/loop` and the model tools. Nothing here creates a
+  // second scheduler, and no state is process-global: the provider's generations
+  // are closure-local to this extension instance.
+
+  /** Reject a prompt the unified dispatcher would refuse to deliver. */
+  const assertDeliverable = (prompt: string): void => {
+    const decision = dispatcher.classify(prompt);
+    if (decision.action === "reject") {
+      throw new ScheduledPromptRejectedError(decision);
+    }
+  };
+
+  /** Summarize a just-created task, rejecting one that expired before its first run. */
+  const createdSummary = (task: ScheduledTask, what: string): LoopTaskSummary => {
+    const live = registry.get(task.id);
+    if (!live) {
+      throw new LoopServiceInputError(`${what} task would expire before its first run`);
+    }
+    return summarizeTask(live);
+  };
+
+  const serviceBackend: LoopServiceBackend = {
+    scheduleFixed(intervalMs, prompt, options) {
+      assertDeliverable(prompt);
+      const task = scheduler.scheduleFixed(
+        intervalMs,
+        prompt,
+        options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+      );
+      return createdSummary(task, "fixed");
+    },
+    scheduleCron(expression, prompt, options) {
+      assertDeliverable(prompt);
+      const task = scheduler.scheduleCron(expression, prompt, {
+        ...(options?.timeZone === undefined ? {} : { timeZone: options.timeZone }),
+        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+      });
+      return createdSummary(task, "cron");
+    },
+    scheduleOnce(at, prompt, options) {
+      assertDeliverable(prompt);
+      const task = scheduler.scheduleOnce(
+        at,
+        prompt,
+        options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+      );
+      return createdSummary(task, "one-shot");
+    },
+    scheduleSelfPaced(prompt, options) {
+      assertDeliverable(prompt);
+      const task = scheduler.scheduleSelfPaced(prompt, {
+        ...(options?.fallbackDelayMs === undefined ? {} : { fallbackDelayMs: options.fallbackDelayMs }),
+        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+      });
+      return summarizeTask(registry.get(task.id) ?? task);
+    },
+    listTasks: () => registry.list().map(summarizeTask),
+    deleteTask: (id) => {
+      if (!registry.has(id)) {
+        return false;
+      }
+      scheduler.stopTask(id);
+      // Defensive: stopTask removes a tracked task from the registry. If the
+      // registry held an untracked record, drop it so delete always converges.
+      if (registry.has(id)) {
+        registry.delete(id);
+      }
+      return true;
+    },
+    scheduleTaskWakeup: (id, delayMs, reason) => scheduler.scheduleTaskWakeup(id, delayMs, reason),
+    stopTask: (id) => scheduler.stopTask(id),
+  };
+
+  const serviceProvider = createLoopServiceProvider({
+    backend: serviceBackend,
+    onChange: () => refreshUi(),
+  });
+
+  // Discovery rides Pi's documented extension event bus. Guarded so a Pi line
+  // without `pi.events` simply exposes no discoverable service.
+  const eventBus = (pi as unknown as { events?: EventBusLike }).events;
+  if (eventBus) {
+    serviceProvider.register(eventBus);
+  }
+  if (disabled) {
+    serviceProvider.setUnavailable(
+      `Loop scheduling is disabled (${LOOP_DISABLE_ENV}); the scheduler service is unavailable.`,
+    );
   }
 
   /**
@@ -405,15 +506,33 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // Invalidate the previous generation *before* rebuilding, and publish the
+    // new one only once reconstruction is complete. A synchronous change listener
+    // can therefore never discover a service that points at the pre-rebuild
+    // registry.
+    if (!disabled) {
+      serviceProvider.endSession();
+    }
     reconstruct(ctx);
+    if (!disabled) {
+      serviceProvider.beginSession();
+    }
   });
 
   // Navigating the session tree changes the active branch, so rebuild from the
   // new branch: tasks created on an abandoned branch are dropped and tasks on
-  // the entered branch are restored (without duplicating entries).
+  // the entered branch are restored (without duplicating entries). The rebuild
+  // also retires the previous service generation before it runs, so a handle
+  // captured before navigation cannot silently mutate the rebuilt state.
   pi.on("session_tree", (_event, ctx) => {
     latestCtx = ctx;
+    if (!disabled) {
+      serviceProvider.endSession();
+    }
     reconstruct(ctx);
+    if (!disabled) {
+      serviceProvider.beginSession();
+    }
   });
 
   // Refresh the context and idle snapshot whenever an agent run boundary moves.
@@ -451,6 +570,8 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     scheduler.stopAll();
     // Drop every task so a reused instance cannot leak state into another session.
     registry.clear();
+    // Invalidate every outstanding service handle before the context is dropped.
+    serviceProvider.endSession();
     // Clear the persistent surfaces before the context is dropped.
     refreshUi(ctx);
     latestCtx = undefined;
@@ -461,3 +582,40 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 export default function loopExtension(pi: ExtensionAPI): void {
   createLoopExtension(pi);
 }
+
+// Public, versioned integration surface for sibling extensions. Import it from
+// the dedicated `pi-loop/service` entrypoint (or from the package root here):
+//
+//   import { discoverLoopService } from "pi-loop/service";
+//
+// Only the consumer-facing contract and discovery protocol are re-exported; the
+// provider internals (`src/service-provider.ts`) are intentionally not part of
+// the package surface.
+export {
+  discoverLoopService,
+  isLoopServiceV1,
+  onLoopServiceChange,
+  LoopServiceInputError,
+  LoopServiceUnavailableError,
+  DEFAULT_DISCOVERY_TIMEOUT_MS,
+  LOOP_SERVICE_CHANGED_CHANNEL,
+  LOOP_SERVICE_DISCOVER_CHANNEL,
+  LOOP_SERVICE_REPLY_CHANNEL_PREFIX,
+  LOOP_SERVICE_VERSION,
+} from "./service.ts";
+export type {
+  DiscoverLoopServiceOptions,
+  EventBusLike,
+  LoopCronOptions,
+  LoopScheduleOptions,
+  LoopSelfPacedOptions,
+  LoopServiceDiscovery,
+  LoopServiceDiscoveryFailure,
+  LoopServiceDiscoveryResponse,
+  LoopServiceStatus,
+  LoopServiceV1,
+  LoopServiceVersion,
+  LoopServiceWakeupDecision,
+  LoopTaskMode,
+  LoopTaskSummary,
+} from "./service.ts";
