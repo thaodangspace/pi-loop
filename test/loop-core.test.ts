@@ -9,6 +9,7 @@ import {
   type SchedulerDeps,
 } from "../src/loop-core.ts";
 import type { ScheduledTask } from "../src/task-registry.ts";
+import type { FixedSchedule } from "../src/schedule.ts";
 import { FakeTimers, testRegistry } from "./helpers.ts";
 
 test("implicit tasks keep literal text and request the default interval", () => {
@@ -183,7 +184,7 @@ test("the scheduler reports the normalized cadence for a sub-minute interval", (
 
   scheduler.start(5_000, "fast");
   assert.equal(scheduler.status().intervalMs, 60_000, "5s normalizes to the 1min cadence");
-  assert.equal(registry.list()[0]?.schedule?.intervalMs, 60_000);
+  assert.equal((registry.list()[0]?.schedule as FixedSchedule | undefined)?.intervalMs, 60_000);
   assert.equal(registry.list()[0]?.nextFireAt, 60_000, "the first boundary is one cadence step out");
 
   scheduler.start(7 * 60_000, "awkward");
@@ -452,7 +453,7 @@ test("a registry-backed dispatch receives the full task record", () => {
   assert.equal(received[0]!.id, "t1");
   assert.equal(received[0]!.prompt, "ping");
   assert.equal(received[0]!.mode, "fixed");
-  assert.equal(received[0]!.schedule?.intervalMs, 60_000, "the snapshot carries the schedule");
+  assert.equal((received[0]!.schedule as FixedSchedule | undefined)?.intervalMs, 60_000, "the snapshot carries the schedule");
   assert.equal(received[0]!.pending, false, "the snapshot matches the authoritative registry");
 });
 

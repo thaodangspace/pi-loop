@@ -13,7 +13,7 @@
  * contains an entry the reader cannot interpret fails closed, so an unknown
  * tombstone can never be bypassed by restoring the readable entries around it.
  */
-import { defaultExpiresAt, type FixedSchedule } from "./schedule.ts";
+import { cloneSchedule, defaultExpiresAt, isValidSchedule, type TaskSchedule } from "./schedule.ts";
 import type { TaskMode } from "./task-registry.ts";
 
 /**
@@ -38,8 +38,8 @@ export interface PersistedTask {
    */
   primary?: boolean;
   createdAt: number;
-  /** Fixed tasks only: the normalized cadence and boundary anchor. */
-  schedule?: FixedSchedule;
+  /** Fixed tasks only: the normalized cadence/anchor or a local-time cron expression. */
+  schedule?: TaskSchedule;
   /**
    * Next fire time. Authoritative for one-shot tasks; for recurring tasks the
    * scheduler recomputes the next boundary from the schedule on restore.
@@ -67,7 +67,7 @@ export interface PersistedUpdateEvent {
   id: string;
   patch: {
     prompt?: string;
-    schedule?: FixedSchedule;
+    schedule?: TaskSchedule;
     nextFireAt?: number;
     expiresAt?: number;
   };
@@ -109,9 +109,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-function isSchedule(value: unknown): value is FixedSchedule {
-  if (!isRecord(value)) return false;
-  return isFiniteNumber(value.intervalMs) && value.intervalMs > 0 && isFiniteNumber(value.anchor);
+function isSchedule(value: unknown): value is TaskSchedule {
+  return isValidSchedule(value);
 }
 
 function isTaskMode(value: unknown): value is TaskMode {
@@ -198,7 +197,7 @@ function parseCreate(data: Record<string, unknown>): ParseEventResult {
     createdAt: raw.createdAt,
     ...(raw.maintenance === true ? { maintenance: true } : {}),
     ...(raw.primary === true ? { primary: true } : {}),
-    ...(raw.schedule === undefined ? {} : { schedule: { intervalMs: raw.schedule.intervalMs, anchor: raw.schedule.anchor } }),
+    ...(raw.schedule === undefined ? {} : { schedule: cloneSchedule(raw.schedule) }),
     ...(raw.nextFireAt === undefined ? {} : { nextFireAt: raw.nextFireAt }),
     ...(raw.expiresAt === undefined ? {} : { expiresAt: raw.expiresAt }),
   };
@@ -229,7 +228,7 @@ function parseUpdate(data: Record<string, unknown>): ParseEventResult {
     ok: true,
     event: updateTaskEvent(data.id, {
       ...(patch.prompt === undefined ? {} : { prompt: patch.prompt }),
-      ...(patch.schedule === undefined ? {} : { schedule: { intervalMs: patch.schedule.intervalMs, anchor: patch.schedule.anchor } }),
+      ...(patch.schedule === undefined ? {} : { schedule: cloneSchedule(patch.schedule) }),
       ...(patch.nextFireAt === undefined ? {} : { nextFireAt: patch.nextFireAt }),
       ...(patch.expiresAt === undefined ? {} : { expiresAt: patch.expiresAt }),
     }),
@@ -267,6 +266,7 @@ export function collectEntries(branch: readonly PersistedEntryLike[]): Persisted
 }
 
 function applyPatch(task: PersistedTask, patch: PersistedUpdateEvent["patch"]): PersistedTask {
+  const schedule = patch.schedule ?? task.schedule;
   return {
     id: task.id,
     prompt: patch.prompt ?? task.prompt,
@@ -274,7 +274,7 @@ function applyPatch(task: PersistedTask, patch: PersistedUpdateEvent["patch"]): 
     ...(task.maintenance ? { maintenance: true } : {}),
     ...(task.primary ? { primary: true } : {}),
     createdAt: task.createdAt,
-    ...((patch.schedule ?? task.schedule) === undefined ? {} : { schedule: patch.schedule ?? task.schedule }),
+    ...(schedule === undefined ? {} : { schedule: cloneSchedule(schedule) }),
     ...((patch.nextFireAt ?? task.nextFireAt) === undefined ? {} : { nextFireAt: patch.nextFireAt ?? task.nextFireAt }),
     ...((patch.expiresAt ?? task.expiresAt) === undefined ? {} : { expiresAt: patch.expiresAt ?? task.expiresAt }),
   };
@@ -361,9 +361,7 @@ export function planRestore(entries: readonly PersistedEntryResult[], now: numbe
         ...(event.task.maintenance ? { maintenance: true } : {}),
         ...(event.task.primary ? { primary: true } : {}),
         createdAt: event.task.createdAt,
-        ...(event.task.schedule === undefined
-          ? {}
-          : { schedule: { intervalMs: event.task.schedule.intervalMs, anchor: event.task.schedule.anchor } }),
+        ...(event.task.schedule === undefined ? {} : { schedule: cloneSchedule(event.task.schedule) }),
         ...(event.task.nextFireAt === undefined ? {} : { nextFireAt: event.task.nextFireAt }),
         ...(event.task.expiresAt === undefined ? {} : { expiresAt: event.task.expiresAt }),
       });

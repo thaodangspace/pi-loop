@@ -12,13 +12,21 @@
  * The scheduler is anchored on a fixed boundary grid (the Unix epoch by
  * default). Because every supported cadence divides a day evenly, the grid
  * never drifts and boundaries are identical regardless of when a task starts.
- * Local-time cron and timezone-aware anchors are a later change.
+ * Calendar (cron) schedules are a separate representation, evaluated in an
+ * injected local timezone; see {@link TaskSchedule}.
  *
  * The module also owns two recurring-fixed-task policies: a deterministic,
  * ID-derived phase offset ({@link jitterOffsetMs}) that spreads same-cadence
  * tasks without changing the cadence, and the default seven-day lifetime
  * ({@link DEFAULT_TASK_TTL_MS}).
+ *
+ * A recurring task's boundary can also come from a 5-field
+ * {@link CronSchedule} in a local timezone. Both kinds are a
+ * {@link TaskSchedule} on the same registry task, and {@link nextTaskFireAt}
+ * dispatches to whichever calculator applies, so cron is a new representation,
+ * not a second scheduler.
  */
+import { isCronSchedule, nextCronFireAt, validateCronSchedule, type CronSchedule } from "./cron.ts";
 
 /** One minute in milliseconds; the finest cadence cron can express. */
 export const MINUTE_MS = 60_000;
@@ -226,4 +234,67 @@ export function nextFireAt(schedule: FixedSchedule, after: number): number {
   const { intervalMs, anchor } = schedule;
   const steps = Math.floor((after - anchor) / intervalMs) + 1;
   return anchor + steps * intervalMs;
+}
+
+/**
+ * Any schedule a recurring task can carry: the interval grid
+ * ({@link FixedSchedule}) or a local-time calendar ({@link CronSchedule}). Both
+ * are stored on the same registry task and advanced by the same scheduler.
+ */
+export type TaskSchedule = FixedSchedule | CronSchedule;
+
+/**
+ * A frozen private copy of a schedule of either kind, so a caller cannot mutate
+ * registry or persisted state by holding a reference to the object it passed in.
+ */
+export function cloneSchedule(schedule: TaskSchedule): TaskSchedule {
+  if (isCronSchedule(schedule)) {
+    return Object.freeze({ kind: "cron", expression: schedule.expression, timeZone: schedule.timeZone });
+  }
+  return Object.freeze({ intervalMs: schedule.intervalMs, anchor: schedule.anchor });
+}
+
+/**
+ * Whether `schedule` is a structurally valid task schedule. Cron expressions and
+ * timezones are fully validated (not just shape-checked), so a persisted
+ * schedule that cannot be calculated is rejected at restore instead of failing
+ * later inside a timer callback.
+ */
+export function isValidSchedule(schedule: unknown): schedule is TaskSchedule {
+  if (typeof schedule !== "object" || schedule === null) {
+    return false;
+  }
+  const candidate = schedule as Record<string, unknown>;
+  if (candidate.kind === "cron") {
+    if (typeof candidate.expression !== "string" || candidate.expression.length === 0) return false;
+    if (typeof candidate.timeZone !== "string" || candidate.timeZone.length === 0) return false;
+    try {
+      validateCronSchedule(candidate.expression, candidate.timeZone);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return (
+    Number.isFinite(candidate.intervalMs) &&
+    (candidate.intervalMs as number) > 0 &&
+    Number.isFinite(candidate.anchor)
+  );
+}
+
+/**
+ * The next boundary for any task schedule. Interval schedules use the jittered
+ * grid (the phase depends on the task's stable ID); cron schedules are exact
+ * local-time occurrences and are never jittered.
+ */
+export function nextTaskFireAt(
+  schedule: TaskSchedule,
+  id: string,
+  after: number,
+  offset: JitterOffset = jitterOffsetMs,
+): number {
+  if (isCronSchedule(schedule)) {
+    return nextCronFireAt(schedule, after);
+  }
+  return nextFireAtJittered(schedule, id, after, offset);
 }

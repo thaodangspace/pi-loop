@@ -44,6 +44,11 @@ conversation while the session stays open.
 - Interval-looking input that cannot be parsed (for example `/loop 5x check`,
   `/loop 1h30min check`, or `/loop .5h check`) fails closed with a usage error.
   It never becomes task text and never disturbs an existing loop.
+- Calendar and one-shot work is available through the model-callable tools
+  instead of `/loop`: `schedule_cron_task` creates a 5-field local-time cron task
+  (for example `0 9 * * 1-5`), and `schedule_once_task` runs a prompt once. Both
+  share the same scheduler, registry, due queue, and persistence. See
+  [Cron and one-shot schedules](#cron-and-one-shot-schedules).
 
 ### Self-paced loops
 
@@ -283,15 +288,83 @@ ignore the file.
   rejected without changing an existing loop. Self-paced wakeup delays are
   clamped into the same 1 minute–1 hour minimum/maximum instead of being
   rejected.
-- **Boundaries are UTC-based for now.** Minute and hour cadences are unaffected
-  for whole-hour timezones, but a `1d` loop currently runs on the UTC day grid.
-  Local-time cron and timezone-safe calculation are tracked separately.
+- **Interval boundaries are UTC-based; cron boundaries are local-time.** Minute
+  and hour interval cadences are unaffected for whole-hour timezones, but a `1d`
+  *interval* loop still runs on the UTC day grid. A **cron** task (below) is the
+  calendar form: its 5 fields are evaluated as wall-clock times in an explicit
+  IANA timezone, across DST transitions.
 - Process sleep can delay a run; on wake, missed boundaries collapse into one
   run and the schedule resumes on the grid.
 
+## Cron and one-shot schedules
+
+An interval (`/loop <n><unit>`) is one representation of a fixed task. The same
+scheduler, registry, due queue, persistence, and expiry machinery also support a
+**standard 5-field cron expression** and **one-shot** tasks. Neither is a second
+scheduler: a cron task is an ordinary `fixed` registry task whose schedule is a
+cron expression, and a one-shot is an ordinary task that removes itself after it
+fires. Both are created through the model-callable tools
+(`schedule_cron_task`, `schedule_once_task`); `/loop` keeps its existing
+interval syntax.
+
+### Cron expressions
+
+A cron expression has five whitespace-separated fields, in order:
+
+```
+minute hour day-of-month month day-of-week
+```
+
+Each field accepts:
+
+- `*` — every value.
+- a single value (`5`, `MON`, `JAN`).
+- a range (`9-17`, `MON-FRI`) — ranges must be ascending.
+- a step (`*/15`, `0-30/10`, or `5/15` meaning "from 5, every 15").
+- a comma-separated list mixing any of the above (`0,30`, `1,15`, `MON,WED,FRI`).
+- month and day-of-week names (`JAN`–`DEC`, `SUN`–`SAT`, case-insensitive).
+
+Sunday is `0` or `7` (both normalize to `0`). Values are validated per field, so
+an invalid schedule reports the exact component: `invalid minute field "61": 61 is
+out of range 0-59`.
+
+**Day-of-month / day-of-week rule.** If *both* fields are restricted (each
+selects fewer than all of its values), a day matches when **either** field
+matches. Otherwise the restricted field alone decides:
+
+| Expression | Meaning |
+|---|---|
+| `0 0 1 * 1` | midnight on the 1st **or** any Monday |
+| `0 0 1 * *` | midnight on the 1st of every month |
+| `0 0 * * 1` | midnight every Monday |
+
+**Timezone and DST.** Occurrences are local wall-clock times in the schedule's
+IANA `timeZone` (defaults to the session's local zone; tests inject one for
+determinism), converted to absolute instants with the offset in force then. A
+local time skipped by a spring-forward gap does not run that day, and a time
+repeated by a fall-back overlap runs once at its **first** occurrence. The next
+occurrence is always strictly in the future and the search is bounded (eight
+years), so an impossible schedule such as `0 0 31 2 *` reports an error instead
+of looping. Cron boundaries are never jittered.
+
+A cron task keeps the default seven-day recurring lifetime, so a weekly or rarer
+schedule needs an explicit `expiresIn` that covers its first run (for example
+`schedule_cron_task` with `expiresIn: "30d"`). Missed occurrences are skipped:
+after a busy period or a reload the next future occurrence is recomputed from the
+expression, never replayed.
+
+### One-shot tasks
+
+A one-shot task fires **once**, then removes itself. It can be scheduled from a
+relative delay (`delay: "30min"`) or an absolute timestamp with an explicit
+offset or `Z` (`at: "2026-10-01T09:00:00-04:00"`); the absolute form requires the
+offset so its meaning never depends on the host zone. A one-shot is persisted
+like a fixed task, but a run whose time already passed while the session was
+closed is **dropped, never replayed**, on resume.
+
 ## Model-callable tools
 
-Alongside the `/loop` command, the extension registers five model-callable tools.
+Alongside the `/loop` command, the extension registers seven model-callable tools.
 They operate on the **same session-scoped task registry and scheduler** as
 `/loop`, so a task created by a tool appears in the registry, participates in the
 same due queue and timers, and is persisted the same way.
@@ -299,16 +372,18 @@ same due queue and timers, and is persisted the same way.
 | Tool | Kind | Purpose |
 |---|---|---|
 | `schedule_task` | Mutating | Create a recurring fixed task from `interval`, `prompt`, and an optional `expiresIn`. Returns the stable task ID. |
-| `list_scheduled_tasks` | Read-only | List active tasks with ID, mode, cadence, next fire time, expiry, and pending status. |
+| `schedule_cron_task` | Mutating | Create a recurring task from a 5-field local-time `cron` expression, optional `timeZone`, and optional `expiresIn`. Invalid fields are reported. |
+| `schedule_once_task` | Mutating | Create a task that fires once from either `delay` or an absolute `at` timestamp, then removes itself. |
+| `list_scheduled_tasks` | Read-only | List active tasks with ID, mode, cadence/cron, next fire time, expiry, and pending status. |
 | `delete_scheduled_task` | Mutating | Delete one task by its stable ID, cancelling its timer and any queued run. |
 | `schedule_wakeup` | Mutating | Choose the next wakeup of the active self-paced loop from `delayMs` and an optional `reason`; the scheduler clamps to 1 minute–1 hour. |
 | `stop_wakeup` | Mutating | Stop the active self-paced loop and cancel its future wakeups. |
 
 Coherence with `/loop`:
 
-- Tool-created tasks are **independent** of the command-owned loop:
-  `schedule_task` never replaces the loop, and `stop_wakeup` and `/loop stop`
-  never cancel tool-created tasks. Use `delete_scheduled_task` for those.
+- Tool-created tasks (interval, cron, and one-shot) are **independent** of the
+  command-owned loop: they never replace the loop, and `stop_wakeup` and
+  `/loop stop` never cancel them. Use `delete_scheduled_task` for those.
 - `/loop status` keeps describing the command-owned loop only; use
   `list_scheduled_tasks` to see every task.
 - `schedule_wakeup` and `stop_wakeup` are scoped to the **active self-paced
@@ -319,6 +394,11 @@ Validation and safety boundaries:
 
 - Intervals and `expiresIn` use the same parser as `/loop` (`s`, `min`, `h`,
   `d`; positive whole numbers). Malformed values throw and change nothing.
+- A cron expression is validated field by field; the thrown error names the
+  offending component (`minute`, `hour`, `day-of-month`, `month`, `day-of-week`,
+  `timezone`, or the expression itself). An unknown timezone is rejected.
+- `schedule_once_task` requires exactly one of `delay` or `at`; `at` must be an
+  ISO-8601 timestamp with an explicit offset or `Z` and must be in the future.
 - Prompts are validated non-empty and classified like `/loop` prompts, so a
   control command or unknown skill is rejected before a task is created.
 - The active-task limit and an expiry that lands before the first run are
@@ -355,13 +435,14 @@ The logic is split so it can be tested without Pi:
 |---|---|
 | `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, ID-based jitter, seven-day default expiry, injected clock and dispatch). |
 | `src/due-queue.ts` | Scheduler-owned per-task due queue: coalesces repeated misses and defines the deterministic flush order (earliest missed deadline, ties by registration). |
-| `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps), `nextFireAt` boundary calculation, the FNV-1a ID hash with bounded jitter offsets, and the default seven-day task lifetime. |
+| `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps), `nextFireAt` boundary calculation, the FNV-1a ID hash with bounded jitter offsets, the default seven-day task lifetime, and the `TaskSchedule` union that dispatches interval vs cron. |
+| `src/cron.ts` | Pure 5-field cron: per-field parsing/validation (wildcard, value, step, range, list, names), the documented DOM/DOW OR rule, timezone-aware next-occurrence calculation with DST gap/overlap handling, and a bounded search. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader. |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
-| `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
+| `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
 | `src/index.ts` | Pi wiring: command, tool registration, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
@@ -399,7 +480,12 @@ TypeBox schemas, read-only vs mutating metadata, sequential execution), fixed
 creation/firing/expiry, malformed interval/prompt/control-prompt rejection, the
 task limit, exact-ID deletion and unknown-ID not-found, pending-run cancellation,
 read-only listing, self-paced clamp/reschedule/stop, and `/loop`/tool registry
-coherence and restore.
+coherence and restore. Cron coverage adds deterministic per-field parsing and
+validation (including the named field on an error), the DOM/DOW OR rule,
+local-time resolution in an injected zone, DST spring-forward gaps and fall-back
+overlaps, an impossible-schedule bound, cron scheduler firing/coalescing/
+recompute-on-restore/expiry, far-future occurrences beyond the `setTimeout`
+cap, and a missed one-shot being dropped on restore.
 
 ### Live smoke test
 

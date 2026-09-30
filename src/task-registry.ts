@@ -11,7 +11,7 @@
  * tools build on this service rather than creating separate schedulers.
  */
 import { randomUUID } from "node:crypto";
-import type { FixedSchedule } from "./schedule.ts";
+import { cloneSchedule, isValidSchedule, type TaskSchedule } from "./schedule.ts";
 
 /** How a task decides when it should run next. */
 export type TaskMode = "fixed" | "self-paced" | "one-shot";
@@ -35,10 +35,11 @@ export interface ScheduledTask {
   /** Creation time from the injected clock. */
   readonly createdAt: number;
   /**
-   * Schedule representation for fixed tasks: the normalized cadence and the
-   * boundary anchor. Absent for self-paced and one-shot tasks.
+   * Schedule representation for fixed tasks: either the normalized interval
+   * cadence and boundary anchor, or a local-time cron expression. Absent for
+   * self-paced and one-shot tasks.
    */
-  readonly schedule?: FixedSchedule;
+  readonly schedule?: TaskSchedule;
   /** When the task is next due, if a schedule has been computed yet. */
   readonly nextFireAt?: number;
   /**
@@ -62,7 +63,7 @@ export interface NewTask {
   mode: TaskMode;
   /** Mark a maintenance loop, whose prompt is re-resolved on every run. */
   maintenance?: boolean;
-  schedule?: FixedSchedule;
+  schedule?: TaskSchedule;
   nextFireAt?: number;
   expiresAt?: number;
   reason?: string;
@@ -79,7 +80,7 @@ export interface RestoredTask {
   mode: TaskMode;
   maintenance?: boolean;
   createdAt: number;
-  schedule?: FixedSchedule;
+  schedule?: TaskSchedule;
   nextFireAt?: number;
   expiresAt?: number;
 }
@@ -91,7 +92,7 @@ export interface RestoredTask {
 export interface TaskUpdate {
   prompt?: string;
   pending?: boolean;
-  schedule?: FixedSchedule | null;
+  schedule?: TaskSchedule | null;
   nextFireAt?: number | null;
   /** Expiry time; pass `null` to clear it, or omit it to keep the current value. */
   expiresAt?: number | null;
@@ -160,8 +161,8 @@ function assertPrompt(prompt: string): void {
  * by holding a reference to the object it passed in. The store stays shallow
  * until this point; this makes the nested value immutable too.
  */
-function freezeSchedule(schedule: FixedSchedule): FixedSchedule {
-  return Object.freeze({ intervalMs: schedule.intervalMs, anchor: schedule.anchor });
+function freezeSchedule(schedule: TaskSchedule): TaskSchedule {
+  return cloneSchedule(schedule);
 }
 
 /**
@@ -249,7 +250,7 @@ export class TaskRegistry {
     }
     if (
       input.schedule !== undefined &&
-      (!Number.isFinite(input.schedule.intervalMs) || !Number.isFinite(input.schedule.anchor))
+      !isValidSchedule(input.schedule)
     ) {
       throw new TaskRegistryError(`restored task ${input.id} has an invalid schedule`);
     }

@@ -8,6 +8,7 @@ import {
   TaskRegistry,
   TaskRegistryError,
 } from "../src/task-registry.ts";
+import type { FixedSchedule } from "../src/schedule.ts";
 
 /** A registry with a controllable clock and deterministic IDs. */
 function makeRegistry(options: { maxTasks?: number } = {}): {
@@ -111,8 +112,8 @@ test("the registry stores a frozen copy of the schedule, not the caller's object
   // Mutating the caller's object must not change the stored snapshot.
   mutable.intervalMs = 1;
   mutable.anchor = 999;
-  assert.equal(registry.get(task.id)?.schedule?.intervalMs, 300_000);
-  assert.equal(registry.get(task.id)?.schedule?.anchor, 0);
+  assert.equal((registry.get(task.id)?.schedule as FixedSchedule | undefined)?.intervalMs, 300_000);
+  assert.equal((registry.get(task.id)?.schedule as FixedSchedule | undefined)?.anchor, 0);
 
   // The stored schedule is frozen, so it cannot be mutated through the snapshot.
   assert.equal(Object.isFrozen(task.schedule), true);
@@ -124,7 +125,7 @@ test("the registry stores a frozen copy of the schedule, not the caller's object
   const source = { intervalMs: 600_000, anchor: 0 };
   const updated = registry.update(task.id, { schedule: source });
   source.anchor = 5;
-  assert.equal(registry.get(task.id)?.schedule?.anchor, 0);
+  assert.equal((registry.get(task.id)?.schedule as FixedSchedule | undefined)?.anchor, 0);
   assert.equal(Object.isFrozen(updated.schedule), true);
 });
 

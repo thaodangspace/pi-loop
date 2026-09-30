@@ -16,15 +16,18 @@ import {
   type PersistedTask,
 } from "./persistence.ts";
 import {
+  cloneSchedule,
   createSchedule,
   DAY_MS,
   defaultExpiresAt,
   HOUR_MS,
   jitterOffsetMs,
+  MAX_CADENCE_MS,
   MINUTE_MS,
-  nextFireAtJittered,
-  type FixedSchedule,
+  nextTaskFireAt,
+  type TaskSchedule,
 } from "./schedule.ts";
+import { createCronSchedule, isCronSchedule } from "./cron.ts";
 import type { RestoredTask, ScheduledTask, TaskMode, TaskRegistry, TaskUpdate } from "./task-registry.ts";
 
 /** Minimum accepted parse-time interval. Sub-minute values normalize at scheduling. */
@@ -343,7 +346,7 @@ export interface LoopStatus {
   /** Self-paced only: the reason supplied with the most recent wakeup. */
   reason?: string;
   /** The stored schedule representation, when a fixed loop is active. */
-  schedule?: FixedSchedule;
+  schedule?: TaskSchedule;
 }
 
 /** Thrown when a wakeup operation is used without an active self-paced loop. */
@@ -391,6 +394,15 @@ export interface StartOptions {
    * One-shot and self-paced tasks have no default expiry.
    */
   expiresAt?: number;
+}
+
+/** Options accepted when scheduling a recurring cron task. */
+export interface CronStartOptions extends StartOptions {
+  /**
+   * IANA timezone the expression is interpreted in. Defaults to the process's
+   * local zone. Tests inject a fixed zone for determinism.
+   */
+  timeZone?: string;
 }
 
 /** Options accepted when starting a self-paced loop. */
@@ -470,6 +482,13 @@ interface TrackedTask {
   token: number;
   /** The single armed timer for this task, or null while none is armed. */
   timer: unknown;
+  /**
+   * Absolute time the armed timer is meant to fire. When the delay had to be
+   * capped below `timerDue`, the timer fires early and is re-armed for the rest.
+   */
+  timerDue: number | undefined;
+  /** True when the armed timer's delay was capped at the maximum timer delay. */
+  timerCapped: boolean;
   /** Self-paced only: a delivered run still owes a next-wakeup decision. */
   awaitingDecision: boolean;
   /** Self-paced only: the one bounded fallback has already been granted. */
@@ -499,6 +518,10 @@ interface TrackedTask {
  *   stable ID (see {@link jitterOffsetMs}), bounded to a fraction of its cadence
  *   so load spreads without changing the cadence. One-shot and self-paced tasks
  *   are never jittered.
+ * - A recurring task whose schedule is a 5-field {@link CronSchedule} fires at
+ *   the expression's local-time occurrences in its timezone, also as absolute
+ *   times. Cron boundaries are never jittered, and a missed occurrence is
+ *   skipped: the next boundary is recomputed from the expression, never replayed.
  * - A recurring fixed task expires {@link DEFAULT_TASK_TTL_MS} after creation
  *   unless the caller supplied an explicit expiry. A boundary exactly at the
  *   expiry may still run; any later run is dropped, and an expired task is
@@ -540,7 +563,7 @@ export class LoopScheduler implements WakeupService {
   private readonly due = new DueQueue();
   /** The command-owned task, described by {@link status}. */
   private primaryId: string | undefined;
-  private primarySchedule: FixedSchedule | undefined;
+  private primarySchedule: TaskSchedule | undefined;
   private disposed = false;
   private nextSeq = 0;
   private nextToken = 1;
@@ -602,6 +625,27 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
+   * Schedule a recurring task on a 5-field local-time cron expression.
+   *
+   * The cron schedule is stored on an ordinary `fixed` registry task and joins
+   * the same due queue, persistence, and timer machinery as an interval task.
+   * Unlike interval tasks, cron boundaries are exact local-time occurrences and
+   * are never jittered. The first occurrence is computed from `now` in
+   * `options.timeZone` (default: the process zone).
+   */
+  scheduleCron(expression: string, task: string, options: CronStartOptions = {}): ScheduledTask {
+    this.assertUsable();
+    if (!task.trim()) {
+      throw new Error("task must not be empty");
+    }
+    const schedule = createCronSchedule(expression, options.timeZone);
+    const { task: created, entry } = this.createScheduledTask(schedule, task, options);
+    this.persistCreate(created);
+    this.arm(entry, created);
+    return created;
+  }
+
+  /**
    * Create and track one recurring fixed task.
    *
    * The default lifetime is {@link DEFAULT_TASK_TTL_MS} from creation; an
@@ -614,8 +658,16 @@ export class LoopScheduler implements WakeupService {
     intervalMs: number,
     task: string,
     options: StartOptions,
-  ): { task: ScheduledTask; entry: TrackedTask; schedule: FixedSchedule } {
-    const schedule = createSchedule(intervalMs);
+  ): { task: ScheduledTask; entry: TrackedTask; schedule: TaskSchedule } {
+    return this.createScheduledTask(createSchedule(intervalMs), task, options);
+  }
+
+  /** Create and track one recurring task from a built interval or cron schedule. */
+  private createScheduledTask(
+    schedule: TaskSchedule,
+    task: string,
+    options: StartOptions,
+  ): { task: ScheduledTask; entry: TrackedTask; schedule: TaskSchedule } {
     const now = this.deps.now();
     const created = this.registry.create({
       prompt: task,
@@ -671,6 +723,12 @@ export class LoopScheduler implements WakeupService {
   restore(input: PersistedTask): ScheduledTask | undefined {
     this.assertUsable();
     if (input.mode === "self-paced") {
+      return undefined;
+    }
+    // A one-shot whose time already passed while the session was closed must
+    // never be replayed. The persistence planner enforces this too; the guard
+    // here keeps a direct `restore` call consistent with that guarantee.
+    if (input.mode === "one-shot" && input.nextFireAt !== undefined && input.nextFireAt <= this.deps.now()) {
       return undefined;
     }
     const existing = this.registry.get(input.id);
@@ -754,7 +812,7 @@ export class LoopScheduler implements WakeupService {
     }
     const patch: Parameters<typeof updateTaskEvent>[1] = {};
     if (update.prompt !== undefined) patch.prompt = updated.prompt;
-    if (update.schedule !== undefined && updated.schedule !== undefined) patch.schedule = { ...updated.schedule };
+    if (update.schedule !== undefined && updated.schedule !== undefined) patch.schedule = cloneSchedule(updated.schedule);
     if (update.nextFireAt !== undefined && updated.nextFireAt !== undefined) patch.nextFireAt = updated.nextFireAt;
     if (update.expiresAt !== undefined && updated.expiresAt !== null) patch.expiresAt = updated.expiresAt;
     if (Object.keys(patch).length > 0) {
@@ -967,7 +1025,10 @@ export class LoopScheduler implements WakeupService {
     const selfPaced = task?.mode === "self-paced";
     return {
       active: task !== undefined,
-      intervalMs: this.primarySchedule?.intervalMs ?? 0,
+      intervalMs:
+        this.primarySchedule !== undefined && !isCronSchedule(this.primarySchedule)
+          ? this.primarySchedule.intervalMs
+          : 0,
       task: task?.prompt ?? "",
       pending: entry !== undefined && this.due.has(entry.id),
       ...(task === undefined ? {} : { mode: task.mode }),
@@ -1004,6 +1065,8 @@ export class LoopScheduler implements WakeupService {
       seq: this.nextSeq++,
       token: this.nextToken++,
       timer: null,
+      timerDue: undefined,
+      timerCapped: false,
       awaitingDecision: false,
       fallbackUsed: false,
       fallbackDelayMs: DEFAULT_WAKEUP_FALLBACK_MS,
@@ -1032,11 +1095,12 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * The next jittered boundary for a task. The phase offset is derived from the
-   * task's stable ID, so it is identical on creation and on every restore.
+   * The next boundary for a task. Interval schedules use the ID-derived jitter
+   * phase; cron schedules are exact local-time occurrences and are never
+   * jittered.
    */
-  private nextBoundary(schedule: FixedSchedule, id: string, after: number): number {
-    return nextFireAtJittered(schedule, id, after, this.deps.jitterOffset ?? jitterOffsetMs);
+  private nextBoundary(schedule: TaskSchedule, id: string, after: number): number {
+    return nextTaskFireAt(schedule, id, after, this.deps.jitterOffset ?? jitterOffsetMs);
   }
 
   /**
@@ -1073,8 +1137,12 @@ export class LoopScheduler implements WakeupService {
     }
     this.clearTimer(entry);
     const now = this.deps.now();
-    const due =
-      task.nextFireAt !== undefined && task.nextFireAt > now
+    // Cron boundaries are exact local-time occurrences, so always recompute the
+    // true next one (a stored time may be stale after a reload or a long busy
+    // period). Interval boundaries keep their stored, ID-jittered phase.
+    const due = isCronSchedule(schedule)
+      ? this.nextBoundary(schedule, entry.id, now)
+      : task.nextFireAt !== undefined && task.nextFireAt > now
         ? task.nextFireAt
         : this.nextBoundary(schedule, entry.id, now);
     const expiresAt = this.registry.get(entry.id)?.expiresAt ?? task.expiresAt;
@@ -1085,7 +1153,7 @@ export class LoopScheduler implements WakeupService {
     if (due !== task.nextFireAt) {
       this.registry.update(entry.id, { nextFireAt: due });
     }
-    this.armTimer(entry, due - now);
+    this.armTimer(entry, due);
   }
 
   /** Arm a one-shot timer for the self-paced task's stored `nextFireAt`. */
@@ -1106,11 +1174,23 @@ export class LoopScheduler implements WakeupService {
       return;
     }
     this.clearTimer(entry);
-    this.armTimer(entry, Math.max(0, due - this.deps.now()));
+    this.armTimer(entry, due);
   }
 
-  private armTimer(entry: TrackedTask, delayMs: number): void {
+  /**
+   * Arm one timer for the absolute time `due`.
+   *
+   * The delay is capped at {@link MAX_CADENCE_MS} because `setTimeout` treats an
+   * oversized delay as zero (a spin). When capped, the callback fires early and
+   * {@link onTick} re-arms for the remainder, so a boundary arbitrarily far in
+   * the future (a yearly cron occurrence) is still reached without overflow.
+   */
+  private armTimer(entry: TrackedTask, due: number): void {
     const token = entry.token;
+    entry.timerDue = due;
+    const remaining = due - this.deps.now();
+    entry.timerCapped = remaining > MAX_CADENCE_MS;
+    const delayMs = Math.max(0, Math.min(remaining, MAX_CADENCE_MS));
     entry.timer = this.deps.setTimer(() => {
       entry.timer = null;
       // A replaced task has a fresh entry (and token); a stopped task has none.
@@ -1125,6 +1205,12 @@ export class LoopScheduler implements WakeupService {
     const task = this.registry.get(entry.id);
     if (!task) {
       this.forget(entry);
+      return;
+    }
+    // A capped timer fires early (see `armTimer`); re-arm for the remainder
+    // instead of treating the early wake as a real boundary.
+    if (entry.timerCapped && entry.timerDue !== undefined && this.deps.now() < entry.timerDue) {
+      this.armTimer(entry, entry.timerDue);
       return;
     }
     if (task.mode === "self-paced") {
@@ -1379,9 +1465,7 @@ export class LoopScheduler implements WakeupService {
       ...(task.maintenance ? { maintenance: true } : {}),
       ...(this.primaryId === task.id ? { primary: true } : {}),
       createdAt: task.createdAt,
-      ...(task.schedule === undefined
-        ? {}
-        : { schedule: { intervalMs: task.schedule.intervalMs, anchor: task.schedule.anchor } }),
+      ...(task.schedule === undefined ? {} : { schedule: cloneSchedule(task.schedule) }),
       ...(task.nextFireAt === undefined ? {} : { nextFireAt: task.nextFireAt }),
       ...(task.expiresAt === undefined ? {} : { expiresAt: task.expiresAt }),
     };

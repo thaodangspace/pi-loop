@@ -6,10 +6,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import { createLoopExtension, type LoopExtensionDeps } from "../src/index.ts";
+import { CronScheduleError } from "../src/cron.ts";
 import { IntervalError, WakeupError } from "../src/loop-core.ts";
 import { ScheduledPromptRejectedError } from "../src/dispatch.ts";
 import { TaskLimitError, TaskNotFoundError } from "../src/task-registry.ts";
 import { SCHEDULER_TOOL_NAMES } from "../src/tools.ts";
+import type { FixedSchedule } from "../src/schedule.ts";
 import { FakeCtx, FakePi, FakeTimers, missingFile, testRegistry } from "./helpers.ts";
 
 const NAMES = SCHEDULER_TOOL_NAMES;
@@ -60,7 +62,15 @@ test("every scheduler tool is registered with a distinct name and typed schema",
   const names = [...pi.tools.keys()];
   assert.deepEqual(
     names.sort(),
-    [NAMES.scheduleTask, NAMES.listTasks, NAMES.deleteTask, NAMES.scheduleWakeup, NAMES.stopWakeup].sort(),
+    [
+      NAMES.scheduleTask,
+      NAMES.scheduleCronTask,
+      NAMES.scheduleOnceTask,
+      NAMES.listTasks,
+      NAMES.deleteTask,
+      NAMES.scheduleWakeup,
+      NAMES.stopWakeup,
+    ].sort(),
   );
   assert.equal(new Set(names).size, names.length, "tool names must be distinct");
   assert.ok(!pi.commands.has("schedule_task"), "tool names must not collide with slash commands");
@@ -77,6 +87,28 @@ test("every scheduler tool is registered with a distinct name and typed schema",
   assert.equal(params.type, "object");
   assert.deepEqual(Object.keys(params.properties).sort(), ["expiresIn", "interval", "prompt"]);
   assert.deepEqual([...(params.required ?? [])].sort(), ["interval", "prompt"]);
+
+  const cron = pi.tools.get(NAMES.scheduleCronTask)!;
+  assert.match(cron.description, /^Mutating\./);
+  assert.deepEqual(
+    Object.keys((cron.parameters as { properties: Record<string, unknown> }).properties).sort(),
+    ["cron", "expiresIn", "prompt", "timeZone"],
+  );
+  assert.deepEqual(
+    [...((cron.parameters as { required?: string[] }).required ?? [])].sort(),
+    ["cron", "prompt"],
+  );
+
+  const once = pi.tools.get(NAMES.scheduleOnceTask)!;
+  assert.match(once.description, /^Mutating\./);
+  assert.deepEqual(
+    Object.keys((once.parameters as { properties: Record<string, unknown> }).properties).sort(),
+    ["at", "delay", "prompt"],
+  );
+  assert.deepEqual(
+    [...((once.parameters as { required?: string[] }).required ?? [])],
+    ["prompt"],
+  );
 
   const list = pi.tools.get(NAMES.listTasks)!;
   assert.match(list.description, /^Read-only\./);
@@ -110,7 +142,7 @@ test("schedule_task creates a fixed task that fires and can be listed", async ()
   assert.match(result.content[0]!.type === "text" ? result.content[0]!.text : "", /Scheduled task/);
   assert.equal(registry.get(id)?.prompt, "check deploy");
   assert.equal(registry.get(id)?.mode, "fixed");
-  assert.equal(registry.get(id)?.schedule?.intervalMs, 300_000);
+  assert.equal((registry.get(id)?.schedule as FixedSchedule | undefined)?.intervalMs, 300_000);
 
   const list = await callTool<{ count: number; tasks: Array<{ id: string; pending: boolean }> }>(
     pi,
@@ -331,4 +363,114 @@ test("a tool-created task is restored from session history under the same stable
   assert.equal(registry.get(id)?.prompt, "persisted");
   timers.advance(300_000);
   assert.deepEqual(pi.sent, ["persisted"]);
+});
+
+test("schedule_cron_task creates a local-time cron task that fires and lists", async () => {
+  const { timers, pi, registry } = setup();
+  const result = await callTool<{
+    ok: boolean;
+    task: { id: string; cron?: string; timeZone?: string; nextFireAt?: number };
+  }>(pi, NAMES.scheduleCronTask, { cron: "*/5 * * * *", prompt: "cron ping", timeZone: "UTC" });
+
+  assert.equal(result.details.ok, true);
+  const id = result.details.task.id;
+  assert.equal(result.details.task.cron, "*/5 * * * *");
+  assert.equal(result.details.task.timeZone, "UTC");
+  assert.equal(result.details.task.nextFireAt, 300_000);
+  assert.match(result.content[0]!.type === "text" ? result.content[0]!.text : "", /cron "\*\/5/);
+  assert.equal(registry.get(id)?.mode, "fixed", "a cron task is a fixed registry task");
+
+  timers.advance(300_000);
+  assert.deepEqual(pi.sent, ["cron ping"]);
+
+  const list = await callTool<{ tasks: Array<{ cron?: string; timeZone?: string }> }>(
+    pi,
+    NAMES.listTasks,
+    {},
+  );
+  assert.equal(list.details.tasks[0]!.cron, "*/5 * * * *");
+  assert.equal(list.details.tasks[0]!.timeZone, "UTC");
+});
+
+test("schedule_cron_task reports the invalid cron field and expires-before-first-run", async () => {
+  const { pi, registry } = setup();
+
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleCronTask, { cron: "61 * * * *", prompt: "bad" }),
+    (error: unknown) => error instanceof CronScheduleError && error.field === "minute",
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleCronTask, { cron: "* * * * *", prompt: "/loop stop" }),
+    (error: unknown) => error instanceof ScheduledPromptRejectedError,
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleCronTask, {
+      cron: "0 0 1 1 *",
+      prompt: "yearly",
+      timeZone: "UTC",
+      expiresIn: "1d",
+    }),
+    /expire before its first run/,
+  );
+  assert.equal(registry.size, 0, "no invalid cron schedule is registered");
+});
+
+test("schedule_once_task runs once from a relative delay, then removes itself", async () => {
+  const { timers, pi, registry } = setup();
+  const result = await callTool<{ ok: boolean; task: { id: string; mode: string; nextFireAt?: number } }>(
+    pi,
+    NAMES.scheduleOnceTask,
+    { delay: "30min", prompt: "run once" },
+  );
+
+  assert.equal(result.details.task.mode, "one-shot");
+  assert.equal(result.details.task.nextFireAt, 30 * 60_000);
+  assert.equal(registry.size, 1);
+
+  timers.advance(30 * 60_000);
+  assert.deepEqual(pi.sent, ["run once"]);
+  assert.equal(registry.size, 0, "a one-shot removes itself after firing");
+  timers.advance(60 * 60_000);
+  assert.deepEqual(pi.sent, ["run once"], "a one-shot never repeats");
+});
+
+test("schedule_once_task accepts an absolute offset timestamp and rejects ambiguity", async () => {
+  const { timers, pi } = setup();
+  const at = new Date(10 * 60_000).toISOString(); // clock starts at 0
+  await callTool(pi, NAMES.scheduleOnceTask, { at, prompt: "absolute" });
+  timers.advance(10 * 60_000);
+  assert.deepEqual(pi.sent, ["absolute"]);
+
+  await assert.rejects(callTool(pi, NAMES.scheduleOnceTask, { prompt: "none" }), /exactly one of delay or at/);
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleOnceTask, { delay: "1min", at, prompt: "both" }),
+    /exactly one of delay or at/,
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleOnceTask, { at: new Date(0).toISOString(), prompt: "past" }),
+    /must be in the future/,
+  );
+  await assert.rejects(
+    callTool(pi, NAMES.scheduleOnceTask, { at: "2026-10-01T09:00:00", prompt: "no offset" }),
+    /explicit offset or Z/,
+  );
+});
+
+test("a tool-created cron task is restored from session history under the same stable ID", async () => {
+  const { timers, pi, registry } = setup();
+  const created = await callTool<{ task: { id: string } }>(pi, NAMES.scheduleCronTask, {
+    cron: "*/5 * * * *",
+    prompt: "persisted cron",
+    timeZone: "UTC",
+  });
+  const id = created.details.task.id;
+
+  const reloaded = new FakeCtx();
+  reloaded.branch = pi.appended.map(({ customType, data }) => ({ type: "custom", customType, data }));
+  pi.fire("session_start", reloaded);
+
+  assert.equal(registry.has(id), true, "the stable cron ID survives the reload");
+  assert.equal(registry.get(id)?.prompt, "persisted cron");
+  timers.advance(300_000);
+  assert.deepEqual(pi.sent, ["persisted cron"]);
 });
