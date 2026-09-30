@@ -25,6 +25,8 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
   createLoopExtension(pi.asExtensionApi(), {
     configPath: "/tmp/loop.json",
     timers,
+    // Isolate tests from an ambient PI_LOOP_DISABLE; switch tests opt in.
+    disabled: false,
     readFile: async () => {
       throw missingFile();
     },
@@ -473,4 +475,29 @@ test("a tool-created cron task is restored from session history under the same s
   assert.equal(registry.get(id)?.prompt, "persisted cron");
   timers.advance(300_000);
   assert.deepEqual(pi.sent, ["persisted cron"]);
+});
+
+test("/loop status lists the command loop and every tool task with ID and mode", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "every 5min command", ctx);
+  const created = await callTool<{ task: { id: string } }>(
+    pi,
+    NAMES.scheduleTask,
+    { interval: "10min", prompt: "tool task" },
+    ctx,
+  );
+
+  await pi.run("loop", "status", ctx);
+  const message = ctx.lastNotification()?.message ?? "";
+  assert.match(message, /Loop every 5min: command/, "the command-owned summary is kept");
+  assert.match(message, /2 scheduled tasks:/);
+  assert.match(message, new RegExp(`${created.details.task.id} · \\[fixed\\] · every 10min`));
+  assert.match(message, /\[fixed\] · every 5min/);
+  assert.match(message, /tool task/);
+
+  // The tool mutation also refreshed the persistent widget.
+  assert.match((ctx.lastWidget() ?? []).join("\n"), /tool task/);
+  timers.advance(0);
+  assert.deepEqual(pi.sent, [], "status is read-only");
 });

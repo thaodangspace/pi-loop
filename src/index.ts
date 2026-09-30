@@ -6,7 +6,13 @@
  * only adapts Pi commands, idle signals, and lifecycle events.
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { loadDefaultInterval, loopConfigPath, type ConfigReader } from "./config.ts";
+import {
+  isLoopDisabled,
+  loadDefaultInterval,
+  loopConfigPath,
+  LOOP_DISABLE_ENV,
+  type ConfigReader,
+} from "./config.ts";
 import {
   createScheduledPromptDispatcher,
   ScheduledPromptRejectedError,
@@ -27,6 +33,8 @@ import {
   type ResolveMaintenanceOptions,
 } from "./maintenance.ts";
 import { collectEntries, PERSISTENCE_CUSTOM_TYPE, planRestore } from "./persistence.ts";
+import { jitterOffsetMs } from "./schedule.ts";
+import { formatStatusLine, formatTaskLines } from "./status.ts";
 import { TaskRegistry, type ScheduledTask } from "./task-registry.ts";
 import { registerSchedulerTools } from "./tools.ts";
 
@@ -41,6 +49,12 @@ export interface LoopExtensionDeps {
   registry?: TaskRegistry;
   /** Override maintenance prompt resolution: project/user paths and reader (tests). */
   maintenance?: ResolveMaintenanceOptions;
+  /**
+   * Explicit disable switch (tests, or an embedding host). When omitted, the
+   * {@link LOOP_DISABLE_ENV} environment variable decides. A disabled extension
+   * registers no scheduling tools, restores no tasks, and starts no timers.
+   */
+  disabled?: boolean;
 }
 
 function errorMessage(error: unknown): string {
@@ -54,17 +68,69 @@ function errorMessage(error: unknown): string {
  * config reads, and a fake Pi API.
  */
 export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = {}): void {
-  const timers = deps.timers ?? systemTimers;
+  // Explicit dependency beats the environment; see LOOP_DISABLE_ENV. Resolved
+  // synchronously at load time so a disabled process never registers tools or
+  // arms a timer.
+  const disabled = deps.disabled ?? isLoopDisabled();
+  const baseTimers = deps.timers ?? systemTimers;
   const configPath = deps.configPath ?? loopConfigPath();
+
+  // Latest context is only used for notifications, the persistent status/widget,
+  // and the authoritative idle check; it is dropped on session shutdown so a
+  // replaced session's context is never reused.
+  let latestCtx: ExtensionContext | undefined;
+  /** Set below; invoked after each scheduler timer callback repaints the UI. */
+  let afterTimerFire: (() => void) | undefined;
+
+  // Wrap the injected timer primitives so every scheduler tick (a due boundary,
+  // a self-paced wakeup, or an expiry) refreshes the visible status. Time and
+  // jitter still come from the underlying primitives, so test clocks are exact.
+  const timers: SchedulerDeps = {
+    now: () => baseTimers.now(),
+    setTimer: (fn, ms) =>
+      baseTimers.setTimer(() => {
+        try {
+          fn();
+        } finally {
+          afterTimerFire?.();
+        }
+      }, ms),
+    clearTimer: (handle) => baseTimers.clearTimer(handle),
+    // Forward to the injected jitter function, falling back to the real
+    // ID-derived hash exactly as the scheduler would when none is injected.
+    jitterOffset: (id, intervalMs) => (baseTimers.jitterOffset ?? jitterOffsetMs)(id, intervalMs),
+  };
 
   // One registry per extension instance, so sessions never share task state.
   // Constructing it creates no timers or other resources.
   const registry = deps.registry ?? new TaskRegistry({ now: () => timers.now() });
 
-  // Latest context is only used for notifications and the authoritative idle
-  // check; it is dropped on session shutdown so a replaced session's context is
-  // never reused.
-  let latestCtx: ExtensionContext | undefined;
+  /** Stable keys for the persistent status text and the editor-adjacent widget. */
+  const STATUS_KEY = "loop";
+
+  /**
+   * Repaint the persistent status/widget from the authoritative registry.
+   *
+   * A no-op without a UI (JSON/print modes, or before a context exists) and when
+   * the UI surface is absent. With no tasks both surfaces are explicitly cleared
+   * so a stopped loop leaves nothing behind.
+   */
+  const refreshUi = (ctx: ExtensionContext | undefined = latestCtx): void => {
+    if (!ctx || !ctx.hasUI) {
+      return;
+    }
+    const tasks = registry.list();
+    if (tasks.length === 0) {
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      ctx.ui.setWidget(STATUS_KEY, undefined);
+      return;
+    }
+    const now = timers.now();
+    ctx.ui.setStatus(STATUS_KEY, formatStatusLine(tasks, now));
+    ctx.ui.setWidget(STATUS_KEY, formatTaskLines(tasks, now), { placement: "belowEditor" });
+  };
+
+  afterTimerFire = () => refreshUi();
 
   const notify = (message: string, type: "info" | "warning" | "error" = "info"): void => {
     latestCtx?.ui.notify(message, type);
@@ -124,12 +190,17 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   // Model-callable tools share this scheduler and registry with `/loop`, so the
   // command and the tools always see and mutate the same session-scoped state.
-  registerSchedulerTools(pi, {
-    scheduler,
-    registry,
-    now: () => timers.now(),
-    classifyPrompt: (prompt) => dispatcher.classify(prompt),
-  });
+  // In disable mode no scheduling tool is registered at all, so the model cannot
+  // create or mutate tasks; `/loop` still explains why.
+  if (!disabled) {
+    registerSchedulerTools(pi, {
+      scheduler,
+      registry,
+      now: () => timers.now(),
+      classifyPrompt: (prompt) => dispatcher.classify(prompt),
+      onChange: () => refreshUi(),
+    });
+  }
 
   /**
    * Rebuild this session's scheduler state from the active branch only.
@@ -140,6 +211,12 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
    * entries, and a task whose ID is already tracked is not duplicated.
    */
   const reconstruct = (ctx: ExtensionContext): void => {
+    // In disable mode nothing is restored, so no timer can be armed from a
+    // resumed session's history.
+    if (disabled) {
+      refreshUi(ctx);
+      return;
+    }
     // Teardown is non-persisting: a reload must not tombstone the tasks it is
     // about to restore.
     scheduler.stopAll();
@@ -152,32 +229,50 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     for (const task of plan.tasks) {
       scheduler.restore(task);
     }
+    refreshUi(ctx);
   };
 
-  const describe = (ctx: ExtensionCommandContext): void => {
-    const state = scheduler.status();
+  /** Describe the command-owned loop, or undefined when none is active. */
+  const describePrimary = (state: ReturnType<LoopScheduler["status"]>): string | undefined => {
     if (!state.active) {
-      ctx.ui.notify("No loop is running.", "info");
-      return;
+      return undefined;
     }
     const pending = state.pending ? " (one run queued for the next idle moment)" : "";
     if (state.maintenance) {
       if (state.mode === "self-paced") {
         const awaiting = state.awaitingDecision ? " (waiting for the next wakeup)" : "";
         const reason = state.reason ? ` (last reason: ${state.reason})` : "";
-        ctx.ui.notify(`Maintenance loop (self-paced)${pending}${awaiting}${reason}`, "info");
-        return;
+        return `Maintenance loop (self-paced)${pending}${awaiting}${reason}`;
       }
-      ctx.ui.notify(`Maintenance loop every ${formatInterval(state.intervalMs)}${pending}`, "info");
-      return;
+      return `Maintenance loop every ${formatInterval(state.intervalMs)}${pending}`;
     }
     if (state.mode === "self-paced") {
       const awaiting = state.awaitingDecision ? " (waiting for the next wakeup)" : "";
       const reason = state.reason ? ` (last reason: ${state.reason})` : "";
-      ctx.ui.notify(`Self-paced loop: ${state.task}${pending}${awaiting}${reason}`, "info");
+      return `Self-paced loop: ${state.task}${pending}${awaiting}${reason}`;
+    }
+    return `Loop every ${formatInterval(state.intervalMs)}: ${state.task}${pending}`;
+  };
+
+  /**
+   * Show the command-owned loop (when one is active) followed by every tracked
+   * task, so independent tool-created tasks are visible with their IDs, modes,
+   * next due/wakeup, and queued state.
+   */
+  const describe = (ctx: ExtensionCommandContext): void => {
+    const tasks = registry.list();
+    if (tasks.length === 0) {
+      ctx.ui.notify("No loop is running.", "info");
       return;
     }
-    ctx.ui.notify(`Loop every ${formatInterval(state.intervalMs)}: ${state.task}${pending}`, "info");
+    const lines: string[] = [];
+    const primary = describePrimary(scheduler.status());
+    if (primary !== undefined) {
+      lines.push(primary);
+    }
+    lines.push(`${tasks.length} scheduled task${tasks.length === 1 ? "" : "s"}:`);
+    lines.push(...formatTaskLines(tasks, timers.now()));
+    ctx.ui.notify(lines.join("\n"), "info");
   };
 
   /** Describe an interval, noting when scheduling rounded it to a cron cadence. */
@@ -217,6 +312,14 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     },
     handler: async (args, ctx) => {
       latestCtx = ctx;
+      if (disabled) {
+        refreshUi(ctx);
+        ctx.ui.notify(
+          `Loop scheduling is disabled (${LOOP_DISABLE_ENV}); /loop and the scheduling tools are unavailable.`,
+          "warning",
+        );
+        return;
+      }
       const command = parseLoopCommand(args);
 
       switch (command.type) {
@@ -226,6 +329,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
         case "stop": {
           const stopped = scheduler.stop();
           ctx.ui.notify(stopped ? "Loop stopped." : "No loop is running.", "info");
+          refreshUi(ctx);
           return;
         }
         case "status":
@@ -250,6 +354,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
               `Maintenance loop (self-paced): loop.md or the built-in prompt, resolved each run (fallback wakeup in ${fallbackText(fallbackDelayMs)} if no next wakeup is chosen).`,
               "info",
             );
+            refreshUi(ctx);
             return;
           }
           scheduler.start(command.intervalMs, BUILT_IN_MAINTENANCE_PROMPT, { maintenance: true });
@@ -258,6 +363,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
             `Maintenance loop every ${cadenceText(command.intervalMs, effectiveMs)}: loop.md or the built-in prompt, resolved each run.`,
             "info",
           );
+          refreshUi(ctx);
           return;
         }
         case "start":
@@ -286,12 +392,14 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
           `Self-paced loop: ${command.task} (fallback wakeup in ${fallbackText(fallbackDelayMs)} if no next wakeup is chosen).`,
           "info",
         );
+        refreshUi(ctx);
         return;
       }
 
       scheduler.start(command.intervalMs, command.task);
       const effectiveMs = scheduler.status().intervalMs;
       ctx.ui.notify(`Loop every ${cadenceText(command.intervalMs, effectiveMs)}: ${command.task}`, "info");
+      refreshUi(ctx);
     },
   });
 
@@ -311,6 +419,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   // Refresh the context and idle snapshot whenever an agent run boundary moves.
   pi.on("agent_start", (_event, ctx) => {
     latestCtx = ctx;
+    refreshUi(ctx);
   });
 
   // `agent_settled` is Pi's final idle boundary. Settle any self-paced iteration
@@ -333,14 +442,17 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       );
     }
     scheduler.flush();
+    refreshUi(ctx);
   });
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", (_event, ctx) => {
     // Stop every tracked task (not just the command-owned loop) so no timer or
     // stale callback survives, then drop the records.
     scheduler.stopAll();
     // Drop every task so a reused instance cannot leak state into another session.
     registry.clear();
+    // Clear the persistent surfaces before the context is dropped.
+    refreshUi(ctx);
     latestCtx = undefined;
   });
 }

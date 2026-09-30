@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    name: Pi ${{ matrix.pi }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The documented minimum (the version this extension is developed and
+        # smoke-tested against) and the newest published line. The matrix runs
+        # the real typecheck and tests against each, so a breaking Pi API change
+        # is caught instead of assumed.
+        pi: ["0.87.1", "0.99.1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Pin Pi ${{ matrix.pi }}
+        if: matrix.pi != '0.87.1'
+        run: npm install --no-save --no-audit --no-fund @earendil-works/pi-coding-agent@${{ matrix.pi }}
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Test
+        run: npm test

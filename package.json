@@ -21,8 +21,11 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test --test-reporter=spec test/*.test.ts"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
     "typebox": "*"
   },
   "devDependencies": {

@@ -12,6 +12,8 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
   createLoopExtension(pi.asExtensionApi(), {
     configPath: "/tmp/loop.json",
     timers,
+    // Isolate tests from an ambient PI_LOOP_DISABLE; switch tests opt in.
+    disabled: false,
     readFile: async () => {
       throw missingFile();
     },
