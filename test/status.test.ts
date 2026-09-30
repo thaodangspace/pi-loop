@@ -10,7 +10,9 @@ import {
   formatClockTime,
   formatCountdown,
   formatStatusLine,
+  formatTaskDetail,
   formatTaskLine,
+  orderStatusTasks,
   summarizePrompt,
 } from "../src/status.ts";
 import type { ScheduledTask } from "../src/task-registry.ts";
@@ -148,4 +150,65 @@ test("summarizePrompt collapses whitespace and elides a long prompt", () => {
   const summary = summarizePrompt(long, 10);
   assert.equal(summary.length, 10);
   assert.ok(summary.endsWith("…"));
+});
+
+test("formatTaskLine marks the command-owned loop and maintenance tasks", () => {
+  const primary = formatTaskLine(
+    task({ id: "t1", mode: "self-paced", maintenance: true, nextFireAt: 60_000 }),
+    0,
+    { primary: true },
+  );
+  assert.equal(primary, "t1 · [self-paced] · primary · maintenance · next in 1min: check deploy");
+
+  const independent = formatTaskLine(
+    task({ id: "t2", mode: "fixed", schedule: { intervalMs: 300_000, anchor: 0 }, nextFireAt: 300_000 }),
+    0,
+  );
+  assert.equal(independent, "t2 · [fixed] · every 5min · next in 5min: check deploy");
+  assert.doesNotMatch(independent, /primary/);
+});
+
+test("orderStatusTasks puts the command-owned loop first, then creation order", () => {
+  const a = task({ id: "a", createdAt: 0 });
+  const b = task({ id: "b", createdAt: 1 });
+  const c = task({ id: "c", createdAt: 2 });
+
+  assert.deepEqual(orderStatusTasks([a, b, c], undefined).map((item) => item.id), ["a", "b", "c"]);
+  assert.deepEqual(orderStatusTasks([a, b, c], "c").map((item) => item.id), ["c", "a", "b"]);
+  assert.deepEqual(orderStatusTasks([a, b, c], "b").map((item) => item.id), ["b", "a", "c"]);
+  assert.deepEqual(
+    orderStatusTasks([a, b, c], "missing").map((item) => item.id),
+    ["a", "b", "c"],
+    "a stale primary ID falls back to registry order",
+  );
+});
+
+test("formatTaskDetail renders the full fields for one task", () => {
+  const detail = formatTaskDetail(
+    task({
+      id: "t1",
+      mode: "fixed",
+      schedule: { intervalMs: 300_000, anchor: 0 },
+      nextFireAt: 300_000,
+      expiresAt: 600_000,
+      reason: "why",
+    }),
+    0,
+    { primary: true },
+  );
+  assert.match(detail, /^Task t1 \(command-owned\) · \[fixed\]/);
+  assert.match(detail, /Schedule: every 5min/);
+  assert.match(detail, /Next run: in 5min/);
+  assert.match(detail, /Status: scheduled/);
+  assert.match(detail, /Expires: in 10min/);
+  assert.match(detail, /Last reason: why/);
+  assert.match(detail, /Prompt: check deploy/);
+
+  const pending = formatTaskDetail(
+    task({ id: "t2", mode: "self-paced", maintenance: true, pending: true }),
+    0,
+  );
+  assert.match(pending, /^Task t2 · \[self-paced · maintenance\]/);
+  assert.match(pending, /Schedule: self-paced \(each iteration chooses its next wakeup\)/);
+  assert.match(pending, /Status: one run queued for the next idle moment/);
 });

@@ -12,7 +12,9 @@ conversation while the session stays open.
 /loop
 /loop 15m
 /loop stop
+/loop stop <id>
 /loop status
+/loop status <id>
 ```
 
 ## What it does
@@ -34,11 +36,18 @@ conversation while the session stays open.
   not map to a clean cron cadence round to the nearest one (`7m` → `6min`,
   `90m` → `2h`). Claude-style boundaries are honored, so a `5min` loop started
   at 12:03 first runs at 12:05.
-- `/loop stop` cancels the loop and any queued run.
-- `/loop status` reports the command-owned loop, then lists **every** tracked
-  task with its stable ID, mode, cadence or cron, next due/wakeup, and whether a
-  run is queued. Independent tasks created by the model-callable tools are
+- `/loop stop` cancels the command-owned loop and any queued run. It never
+  cancels an independent task created by a tool.
+- `/loop stop <id>` cancels exactly the task with that stable ID, whether it is
+  the command-owned loop or an independent one, and reports an unknown ID
+  without disturbing any task.
+- `/loop status` lists **every** active scheduled task with its stable ID, mode,
+  cadence or cron, next due/wakeup, and whether a run is queued. The
+  command-owned loop is listed first and marked `primary`; maintenance loops are
+  marked `maintenance`. Independent tasks created by the model-callable tools are
   therefore visible alongside the loop.
+- `/loop status <id>` shows full detail for one task by its stable ID, and
+  reports an unknown ID clearly.
 - Bare `/loop` and interval-only `/loop <n><unit>` are **maintenance** loops:
   they run a maintenance prompt rather than one you type. Bare `/loop` is
   self-paced; `/loop <n><unit>` runs on a fixed schedule. See
@@ -267,8 +276,9 @@ the authoritative registry (never a separate copy):
   `⟳ 1 loop · next 09:00`. With more than one task it also reports the per-mode
   counts, for example `⟳ 3 loops · 2 fixed · 1 self-paced · next 09:00`;
 - a **widget** below the editor with one line per task, for example
-  `t2 · [fixed] · every 10min · next in 8min: check deploy`, including the
-  `pending` marker while a run waits for the next idle moment.
+  `t2 · [fixed] · primary · every 10min · next in 8min: check deploy`, including
+  the `primary`/`maintenance` markers and the `pending` marker while a run waits
+  for the next idle moment.
 
 The footer is always one line. A single task omits the per-mode breakdown; with
 more than one task it lists a count for each mode present (`fixed`,
@@ -286,7 +296,10 @@ they are cleared. The surfaces are only used when the client has a UI
 tools and event behavior keep working without rendering.
 
 `/loop status` prints the same per-task lines so the command copy and the
-on-screen copy never drift.
+on-screen copy never drift. The list is deterministic: the command-owned loop
+first (marked `primary`), then the remaining tasks in creation order, with the
+`maintenance` marker on loops whose prompt is re-resolved each run. `/loop status
+<id>` shows one task in detail.
 
 ## Disable scheduling
 
@@ -382,7 +395,8 @@ changing it.
   could resurrect a deleted task. Tasks do not run while Pi is closed: missed
   fixed boundaries resume on the grid and a missed one-shot is dropped.
 - **Stopping does not abort work already running.** It prevents future loop
-  messages only.
+  messages only. `/loop stop` cancels the command-owned loop; `/loop stop <id>`
+  cancels exactly one task by its stable ID and leaves every other task running.
 - **Minimum cadence is 1 minute.** Fixed intervals must be positive whole
   numbers with a unit; zero, negatives, fractions, unknown units, and values
   whose normalized cadence overflows the maximum timer delay (about 24 days) are
@@ -488,10 +502,12 @@ Coherence with `/loop`:
 - Tool-created tasks (interval, cron, one-shot, and independent self-paced) are
   **independent** of the command-owned loop: they never replace the loop, and
   `stop_wakeup` and `/loop stop` never cancel them. Use
-  `delete_scheduled_task` for those.
-- `/loop status` prints the command-owned loop summary and then lists **every**
-  task (its ID, mode, cadence/cron, next due/wakeup, and queued state), so the
-  same information is visible without calling `list_scheduled_tasks`.
+  `delete_scheduled_task` or `/loop stop <id>` for those.
+- `/loop status` lists **every** task once (its ID, mode, cadence/cron, next
+  due/wakeup, and queued state), with the command-owned loop first and marked
+  `primary`, so the same information is visible without calling
+  `list_scheduled_tasks`. `/loop status <id>` shows one task in detail, and
+  `/loop stop <id>` cancels exactly one task by ID.
 - `schedule_wakeup` and `stop_wakeup` are scoped to the self-paced iteration
   that is **actually executing** and throw when there is none, so they cannot
   reschedule or cancel the command-owned loop, a fixed task, or another
@@ -664,7 +680,7 @@ The logic is split so it can be tested without Pi:
 | `src/cron.ts` | Pure 5-field cron: per-field parsing/validation (wildcard, value, step, range, list, names), the documented DOM/DOW OR rule, timezone-aware next-occurrence calculation with DST gap/overlap handling, and a bounded search. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader, and the `PI_LOOP_DISABLE` switch (`isLoopDisabled`). |
-| `src/status.ts` | Pure formatting for the persistent footer status/widget and `/loop status`: countdowns, per-task lines (ID, mode, cadence, next due/wakeup, pending), the local-clock-time helper, and the compact footer projection (total, per-mode counts, earliest next time). |
+| `src/status.ts` | Pure formatting for the persistent footer status/widget and `/loop status`: countdowns, per-task lines (ID, mode, `primary`/`maintenance` markers, cadence, next due/wakeup, pending), the deterministic status ordering helper, one-task detail rendering, the local-clock-time helper, and the compact footer projection (total, per-mode counts, earliest next time). |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |

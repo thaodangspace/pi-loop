@@ -141,6 +141,43 @@ test("stop and status are exact commands; otherwise text stays a task", () => {
   });
 });
 
+test("stop and status accept a single task ID; multi-word text stays a task", () => {
+  assert.deepEqual(parseLoopCommand("stop t1"), { type: "stop", id: "t1" });
+  assert.deepEqual(parseLoopCommand("  STOP  t1  "), { type: "stop", id: "t1" });
+  assert.deepEqual(parseLoopCommand("status t9"), { type: "status", id: "t9" });
+  assert.deepEqual(parseLoopCommand("status stop"), { type: "status", id: "stop" });
+  // A multi-word argument is not an ID, so it keeps the literal-task behavior.
+  assert.deepEqual(parseLoopCommand("stop the build server"), {
+    type: "start",
+    task: "stop the build server",
+  });
+  assert.deepEqual(parseLoopCommand("status report for the team"), {
+    type: "start",
+    task: "status report for the team",
+  });
+});
+
+test("stopping the command loop by ID clears primary bookkeeping", () => {
+  const timers = new FakeTimers();
+  const registry = testRegistry(timers);
+  const scheduler = new LoopScheduler(timers, registry, () => {}, () => true);
+
+  const cmd = scheduler.start(60_000, "command");
+  const cmdId = registry.list().find((item) => item.prompt === "command")!.id;
+  const ind = scheduler.scheduleFixed(120_000, "independent");
+  assert.equal(cmd, undefined, "start returns void; the registry is authoritative");
+  assert.equal(scheduler.primaryTaskId(), cmdId);
+  assert.equal(scheduler.status().task, "command");
+
+  assert.equal(scheduler.stopTask(cmdId), true);
+  assert.equal(scheduler.primaryTaskId(), undefined, "primary bookkeeping is cleared");
+  assert.equal(scheduler.status().active, false);
+  assert.equal(registry.has(ind.id), true, "the independent task survives");
+
+  assert.equal(scheduler.stopTask(cmdId), false, "a second stop of the same ID is a no-op");
+  assert.equal(registry.has(ind.id), true);
+});
+
 test("formatInterval uses the largest exact unit", () => {
   assert.equal(formatInterval(1_000), "1s");
   assert.equal(formatInterval(60_000), "1min");
