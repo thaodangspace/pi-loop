@@ -327,7 +327,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
           ctx.ui.notify(usageText(command.reason), "warning");
           return;
         case "stop": {
-          const stopped = scheduler.stop();
+          const stopped = scheduler.stopCommandLoop();
           ctx.ui.notify(stopped ? "Loop stopped." : "No loop is running.", "info");
           refreshUi(ctx);
           return;

@@ -427,12 +427,14 @@ export type IterationSettleResult =
   | { action: "terminated" };
 
 /**
- * The wakeup API an iteration may call while the loop is self-paced.
+ * The wakeup API an iteration may call while its loop is self-paced.
  *
  * This is the scheduler contract, not a prompt-text convention: a delivered
- * iteration either schedules its next wakeup or stops the loop. Anything that
- * exposes these operations to the model (for example a Pi tool) should delegate
- * here rather than re-implement scheduling.
+ * iteration either schedules its next wakeup or stops the loop. The target is
+ * always the iteration that is currently executing (falling back to the
+ * command-owned loop outside a run), so each self-paced task paces itself
+ * independently. Anything that exposes these operations to the model (for
+ * example a Pi tool) should delegate here rather than re-implement scheduling.
  */
 export interface WakeupService {
   /** Schedule the next wakeup, clamping the delay to [1 minute, 1 hour]. */
@@ -534,6 +536,11 @@ interface TrackedTask {
  * - An iteration may stop the loop instead (`stop`).
  * - An iteration that does neither gets one bounded fallback wakeup; if that
  *   fallback iteration also misses, the task terminates rather than spinning.
+ * - Multiple self-paced tasks coexist. Each owns its decision flags, fallback
+ *   allowance, run token, and wakeup timer, so a wakeup, stop, or settle applies
+ *   only to the iteration that is currently executing. A task that becomes due
+ *   while another iteration is active is queued and runs at the next idle
+ *   boundary in the documented due order.
  *
  * Due-queue guarantees:
  * - While Pi is busy a due task is only marked in the scheduler's queue; its
@@ -564,6 +571,15 @@ export class LoopScheduler implements WakeupService {
   /** The command-owned task, described by {@link status}. */
   private primaryId: string | undefined;
   private primarySchedule: TaskSchedule | undefined;
+  /**
+   * The self-paced entry whose iteration is currently executing (or awaiting a
+   * decision). Pi runs one agent turn at a time, so at most one entry is bound;
+   * wakeup, stop, and settle operations resolve through it before falling back to
+   * the command-owned loop. If the bound task is removed mid-turn, the id is kept
+   * as a stale sentinel so those operations fail closed until `settleIteration`
+   * releases it at the turn boundary; `stopAll`/`dispose` also release it.
+   */
+  private activeSelfPacedId: string | undefined;
   private disposed = false;
   private nextSeq = 0;
   private nextToken = 1;
@@ -597,8 +613,8 @@ export class LoopScheduler implements WakeupService {
       throw new Error("task must not be empty");
     }
     // A command start replaces the command-owned loop; independently scheduled
-    // tasks (scheduleFixed) keep running.
-    this.stop();
+    // tasks (scheduleFixed, scheduleSelfPaced) keep running.
+    this.stopCommandLoop();
     const { task: created, entry, schedule } = this.createFixedTask(intervalMs, task, options);
     this.primaryId = created.id;
     this.primarySchedule = schedule;
@@ -822,18 +838,50 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * Start a self-paced loop. The prompt is due immediately; each delivered
-   * iteration is expected to call {@link scheduleNextWakeup} or `stop` before it
-   * settles. A missing choice triggers the bounded fallback described on the
-   * class. The task becomes the command-owned loop.
+   * Start a command-owned self-paced loop. The prompt is due immediately; each
+   * delivered iteration is expected to call {@link scheduleNextWakeup} or `stop`
+   * before it settles. A missing choice triggers the bounded fallback described
+   * on the class.
+   *
+   * A command start replaces the previous command-owned loop (fixed or
+   * self-paced); independently scheduled tasks, including those created with
+   * {@link scheduleSelfPaced}, keep running. The task becomes the command-owned
+   * loop.
    */
   startSelfPaced(prompt: string, options: SelfPacedStartOptions = {}): ScheduledTask {
     this.assertUsable();
     if (!prompt.trim()) {
       throw new Error("task must not be empty");
     }
+    // Replace only the command-owned loop; independent tasks must survive.
+    this.stopCommandLoop();
+    const created = this.createSelfPacedTask(prompt, options);
+    this.primaryId = created.id;
+    this.primarySchedule = undefined;
+    return created;
+  }
+
+  /**
+   * Schedule an additional self-paced task without replacing the command-owned
+   * loop.
+   *
+   * Each self-paced task owns its decision flags, fallback allowance, run token,
+   * and wakeup timer, so independently created tasks pace themselves and cannot
+   * affect one another. The task joins the same scheduler-owned due queue, so it
+   * coalesces while busy and flushes in the documented order alongside every
+   * other due task.
+   */
+  scheduleSelfPaced(prompt: string, options: SelfPacedStartOptions = {}): ScheduledTask {
+    this.assertUsable();
+    if (!prompt.trim()) {
+      throw new Error("task must not be empty");
+    }
+    return this.createSelfPacedTask(prompt, options);
+  }
+
+  /** Create and track one self-paced task with its own iteration state. */
+  private createSelfPacedTask(prompt: string, options: SelfPacedStartOptions): ScheduledTask {
     const fallbackDelayMs = clampWakeupDelay(options.fallbackDelayMs ?? DEFAULT_WAKEUP_FALLBACK_MS);
-    this.stop();
     const created = this.registry.create({
       prompt,
       mode: "self-paced",
@@ -842,26 +890,30 @@ export class LoopScheduler implements WakeupService {
     });
     const entry = this.track(created);
     entry.fallbackDelayMs = fallbackDelayMs;
-    this.primaryId = created.id;
-    this.primarySchedule = undefined;
     this.armSelfPaced(entry, created);
     return created;
   }
 
   /**
-   * Schedule the next wakeup of the command-owned self-paced loop.
+   * Schedule the next wakeup of the self-paced iteration that is running.
+   *
+   * The target is the currently executing iteration when one is bound, otherwise
+   * the command-owned self-paced loop (the pre-multi-task behavior). Only that
+   * task's wakeup state changes, so a choice made by one self-paced task can
+   * never reschedule another.
    *
    * The requested delay is clamped into [1 minute, 1 hour]. An explicit choice
    * clears the fallback allowance and any queued missed run, so the loop cannot
    * be terminated for a miss that a later iteration fixed. Throws
-   * {@link WakeupError} when no self-paced loop is active or the scheduler is
+   * {@link WakeupError} when no self-paced iteration can be resolved — including
+   * when the bound iteration has since been removed — or the scheduler is
    * disposed.
    */
   scheduleNextWakeup(delayMs: number, reason?: string): WakeupDecision {
     if (this.disposed) {
       throw new WakeupError("scheduler has been disposed");
     }
-    const entry = this.primaryEntry();
+    const entry = this.resolveSelfPacedEntry();
     const task = entry === undefined ? undefined : this.registry.get(entry.id);
     if (!entry || !task || task.mode !== "self-paced") {
       throw new WakeupError("no self-paced loop is running");
@@ -888,17 +940,42 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * End the command-owned self-paced iteration and apply the bounded fallback
+   * End the self-paced iteration that actually ran and apply the bounded fallback
    * policy when it neither rescheduled nor stopped. Safe to call at every idle
    * boundary for every mode; returns `{ action: "none" }` when nothing awaited.
+   *
+   * The target is the currently executing iteration when its binding is live.
+   * A stale binding (its task was removed mid-run) fails closed and is cleared at
+   * this turn boundary instead of falling back to the command-owned loop. Only
+   * outside an executing turn does the command-owned self-paced loop become the
+   * backward-compatible target, so settling one self-paced task never grants a
+   * fallback to, terminates, reschedules, or stops another.
    */
   settleIteration(): IterationSettleResult {
     if (this.disposed) {
       return { action: "none" };
     }
-    const entry = this.primaryEntry();
-    const task = entry === undefined ? undefined : this.registry.get(entry.id);
-    if (!entry || !task || task.mode !== "self-paced" || !entry.awaitingDecision) {
+    if (this.activeSelfPacedId !== undefined) {
+      const entry = this.liveBoundEntry();
+      // The turn is over: release the binding before settling, so a callback that
+      // fires during settlement cannot re-enter.
+      this.activeSelfPacedId = undefined;
+      if (entry === undefined) {
+        return { action: "none" };
+      }
+      return this.settleEntry(entry);
+    }
+    const entry = this.primarySelfPacedEntry();
+    if (entry === undefined) {
+      return { action: "none" };
+    }
+    return this.settleEntry(entry);
+  }
+
+  /** Apply the missed-choice policy to one entry, if it is still awaiting one. */
+  private settleEntry(entry: TrackedTask): IterationSettleResult {
+    const task = this.registry.get(entry.id);
+    if (!task || task.mode !== "self-paced" || !entry.awaitingDecision) {
       return { action: "none" };
     }
     entry.awaitingDecision = false;
@@ -906,12 +983,37 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
-   * Cancel the command-owned loop. Returns whether one was running. Idempotent;
-   * independently scheduled tasks are unaffected (use {@link stopTask} or
-   * {@link stopAll}). A deleted fixed task is persisted as a tombstone so the
-   * stop survives a session reload.
+   * Stop the currently executing self-paced iteration. Falls back to the
+   * command-owned loop only when no iteration is executing (backward-compatible
+   * direct-scheduler behavior). A stale binding fails closed: it returns false
+   * and never retargets another task. Idempotent.
+   *
+   * Use {@link stopCommandLoop} to cancel the command-owned loop explicitly, for
+   * example from `/loop stop`, without touching an executing independent task.
    */
   stop(): boolean {
+    if (this.activeSelfPacedId !== undefined) {
+      const entry = this.liveBoundEntry();
+      if (entry === undefined) {
+        // The bound iteration's task is gone; fail closed rather than stopping
+        // the command-owned loop or an unrelated task.
+        return false;
+      }
+      this.stopTask(entry.id);
+      return true;
+    }
+    return this.stopCommandLoop();
+  }
+
+  /**
+   * Cancel the command-owned loop only, leaving independently scheduled tasks
+   * (including a self-paced iteration that is currently executing) running.
+   * Returns whether a command-owned loop was running. Idempotent.
+   *
+   * This is the command-scoped stop used by `/loop stop` and by a command start
+   * that replaces its own loop; {@link stop} is the iteration-scoped stop.
+   */
+  stopCommandLoop(): boolean {
     const id = this.primaryId;
     if (id === undefined) {
       return false;
@@ -957,6 +1059,7 @@ export class LoopScheduler implements WakeupService {
     this.due.clear();
     this.primaryId = undefined;
     this.primarySchedule = undefined;
+    this.activeSelfPacedId = undefined;
   }
 
   /** Permanently disable the scheduler and drop every timer. Idempotent. */
@@ -1049,6 +1152,21 @@ export class LoopScheduler implements WakeupService {
     return [...this.entries.keys()];
   }
 
+  /**
+   * The self-paced task a wakeup/stop operation currently targets: the executing
+   * iteration when one is bound, otherwise the command-owned self-paced loop.
+   * `undefined` when neither exists. Hosts use this to describe or guard
+   * iteration-scoped operations without assuming the target is the primary loop.
+   */
+  activeSelfPacedTask(): ScheduledTask | undefined {
+    const entry = this.resolveSelfPacedEntry();
+    if (entry === undefined) {
+      return undefined;
+    }
+    const task = this.registry.get(entry.id);
+    return task?.mode === "self-paced" ? task : undefined;
+  }
+
   private assertUsable(): void {
     if (this.disposed) {
       throw new Error("scheduler has been disposed");
@@ -1057,6 +1175,50 @@ export class LoopScheduler implements WakeupService {
 
   private primaryEntry(): TrackedTask | undefined {
     return this.primaryId === undefined ? undefined : this.entries.get(this.primaryId);
+  }
+
+  /**
+   * The tracked entry for a live self-paced binding, or `undefined` when the
+   * binding is absent or stale. It deliberately does not clear a stale binding:
+   * the executing turn stays fail-closed until {@link settleIteration} (or
+   * {@link stopTask}) releases it at the turn boundary.
+   */
+  private liveBoundEntry(): TrackedTask | undefined {
+    if (this.activeSelfPacedId === undefined) {
+      return undefined;
+    }
+    const entry = this.entries.get(this.activeSelfPacedId);
+    if (entry === undefined || this.registry.get(entry.id)?.mode !== "self-paced") {
+      return undefined;
+    }
+    return entry;
+  }
+
+  /**
+   * The command-owned loop entry when it is self-paced, else `undefined`. This is
+   * the backward-compatible target for wakeup/stop/settle calls made outside an
+   * executing iteration.
+   */
+  private primarySelfPacedEntry(): TrackedTask | undefined {
+    const entry = this.primaryEntry();
+    if (entry === undefined) {
+      return undefined;
+    }
+    return this.registry.get(entry.id)?.mode === "self-paced" ? entry : undefined;
+  }
+
+  /**
+   * Resolve the self-paced entry a wakeup operation targets: the currently
+   * executing iteration when its binding is live, otherwise the command-owned
+   * self-paced loop. When a binding exists but is stale, this returns `undefined`
+   * (fail closed) and never falls back to the command loop, so a late wakeup from
+   * one task can never hit another.
+   */
+  private resolveSelfPacedEntry(): TrackedTask | undefined {
+    if (this.activeSelfPacedId !== undefined) {
+      return this.liveBoundEntry();
+    }
+    return this.primarySelfPacedEntry();
   }
 
   private track(task: ScheduledTask): TrackedTask {
@@ -1087,6 +1249,12 @@ export class LoopScheduler implements WakeupService {
       this.primaryId = undefined;
       this.primarySchedule = undefined;
     }
+    // The iteration binding is deliberately NOT cleared here. If this entry was
+    // the executing iteration, the agent turn is still active; keeping the now
+    // stale id as a sentinel makes later wakeup/stop/settle calls in the same
+    // turn fail closed instead of retargeting the command-owned loop or another
+    // task. `settleIteration` releases the sentinel at the turn boundary (and
+    // `stopAll`/`dispose` release it on teardown).
   }
 
   /** Drop an entry whose registry task has disappeared, without touching the registry. */
@@ -1329,7 +1497,14 @@ export class LoopScheduler implements WakeupService {
    *
    * The awaiting flag is set *before* dispatch so a dispatch that synchronously
    * reschedules (which clears the flag and arms the next timer) is not
-   * overwritten afterwards.
+   * overwritten afterwards. The entry is bound as the current executing
+   * iteration for the same reason, so an inline {@link scheduleNextWakeup} or
+   * {@link stop} resolves to this task rather than the command-owned loop.
+   *
+   * Only one self-paced iteration runs at a time (Pi dispatches one agent turn at
+   * a time). When a different iteration is already bound, this run is queued for
+   * the next idle boundary instead of running concurrently, so each task's
+   * decision state stays unambiguous.
    *
    * If the prompt cannot be resolved, no iteration runs and therefore no next
    * wakeup can be chosen; the bounded fallback policy applies so a resolution
@@ -1337,6 +1512,13 @@ export class LoopScheduler implements WakeupService {
    */
   private beginSelfPacedRun(entry: TrackedTask, task: ScheduledTask): boolean {
     this.due.remove(entry.id);
+    if (this.activeSelfPacedId !== undefined && this.activeSelfPacedId !== entry.id) {
+      // Another iteration (or a turn whose bound task was removed) owns the
+      // active agent turn. Coalesce this due wakeup into the queue rather than
+      // delivering it concurrently.
+      this.markDue(entry, task.nextFireAt ?? this.deps.now());
+      return false;
+    }
     let prompt: string;
     try {
       prompt = this.resolvePrompt(task);
@@ -1351,6 +1533,7 @@ export class LoopScheduler implements WakeupService {
     const updated = this.registry.update(entry.id, { pending: false });
     entry.runToken += 1;
     entry.awaitingDecision = true;
+    this.activeSelfPacedId = entry.id;
     const delivered = this.safeDispatch(updated, prompt, entry, entry.runToken);
     // A synchronous dispatch error clears the flag in onDispatchError; a
     // replacement/stop during dispatch owns the entry already, so leave it.

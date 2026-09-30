@@ -73,6 +73,22 @@ Self-paced wakeups respect the same idle/due rules as fixed loops: a wakeup that
 comes due while Pi is busy is queued and delivered once when idle, and repeated
 misses coalesce into a single run rather than replaying a backlog.
 
+Self-paced control is scoped to the iteration that is actually executing. Pi
+runs one agent turn at a time, so while an iteration is active the scheduler
+binds it and `schedule_wakeup`/`stop_wakeup` (and the scheduler's own
+`scheduleNextWakeup`/`stop`/`settleIteration`) resolve to that task; outside a
+run they fall back to the command-owned loop. A binding whose task disappears
+while its turn is running (including a delete or `stopTask`) fails closed: the
+late wakeup/stop never retargets the command loop, and the binding is released
+only at the turn boundary (`settleIteration`). `/loop stop` uses the separate,
+command-only `scheduler.stopCommandLoop()`, so it always cancels the
+command-owned loop and never an executing independent task. A host can also create independent
+self-paced tasks with `scheduleSelfPaced(prompt, options)`, which never replaces
+the command-owned loop: each task keeps its own fallback allowance, wakeup, and
+run token, so settling or stopping one can never reschedule, terminate, or stop
+another. A due task that arrives while another iteration is active is queued and
+runs at the next idle boundary in the documented due order.
+
 The wakeup service is scheduler state, not a prompt-text convention. The
 model-facing operations that call it (`schedule_wakeup` and `stop_wakeup`) and
 the task tools are described under [Model-callable tools](#model-callable-tools).
@@ -508,7 +524,7 @@ The logic is split so it can be tested without Pi:
 
 | Module | Responsibility |
 |---|---|
-| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, ID-based jitter, seven-day default expiry, injected clock and dispatch). |
+| `src/loop-core.ts` | Command parsing, interval parsing/validation, and the fixed + self-paced scheduler (task-scoped self-paced iterations, wakeup clamping, bounded fallback, boundary-aligned timer/idle handling, ID-based jitter, seven-day default expiry, injected clock and dispatch). |
 | `src/due-queue.ts` | Scheduler-owned per-task due queue: coalesces repeated misses and defines the deterministic flush order (earliest missed deadline, ties by registration). |
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps), `nextFireAt` boundary calculation, the FNV-1a ID hash with bounded jitter offsets, the default seven-day task lifetime, and the `TaskSchedule` union that dispatches interval vs cron. |
 | `src/cron.ts` | Pure 5-field cron: per-field parsing/validation (wildcard, value, step, range, list, names), the documented DOM/DOW OR rule, timezone-aware next-occurrence calculation with DST gap/overlap handling, and a bounded search. |
@@ -534,6 +550,10 @@ real hash. Scheduler and adapter tests never sleep — they drive time explicitl
 and assert boundary alignment, normalization, coalescing, long busy periods,
 clock jumps, replacement, stop, dispatch errors, cleanup, and the self-paced
 reschedule, clamp, bounded-fallback, termination, and stale-callback paths.
+Multi-task self-paced coverage adds two independent tasks with distinct wakeups,
+per-task fallback counters and termination, iteration-scoped stop/delete, busy
+coalescing and earliest-deadline flush order, cross-task stale async failures,
+and command-owned replacement that preserves independent tasks.
 Due-queue coverage adds per-task coalescing, deterministic flush order for two
 distinct tasks and simultaneous deadlines, long busy windows, deleted/stopped
 tasks and stale callbacks, and flush reentrancy when a dispatch starts work.
