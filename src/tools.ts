@@ -3,8 +3,9 @@
  *
  * These tools expose the session's existing scheduler and task registry to the
  * model without duplicating any scheduling logic: every mutation goes through
- * {@link LoopScheduler} (fixed creation, per-task cancellation, self-paced
- * wakeup reschedule/stop) and every read comes from the authoritative
+ * {@link LoopScheduler} (fixed/cron/one-shot/self-paced creation, per-task
+ * cancellation, self-paced wakeup reschedule/stop) and every read comes from the
+ * authoritative
  * {@link TaskRegistry}. `/loop` and the tools therefore share one registry, one
  * due queue, and one set of timers, so `/loop status`, `/loop stop`, and the
  * tools stay coherent.
@@ -32,7 +33,14 @@ import { Type } from "typebox";
 import { isCronSchedule } from "./cron.ts";
 import type { ScheduledPromptDecision } from "./dispatch.ts";
 import { ScheduledPromptRejectedError } from "./dispatch.ts";
-import { formatInterval, parseInterval, type LoopScheduler } from "./loop-core.ts";
+import {
+  clampWakeupDelay,
+  DEFAULT_WAKEUP_FALLBACK_MS,
+  formatInterval,
+  parseInterval,
+  WakeupError,
+  type LoopScheduler,
+} from "./loop-core.ts";
 import {
   TaskNotFoundError,
   type ScheduledTask,
@@ -45,6 +53,7 @@ export const SCHEDULER_TOOL_NAMES = {
   scheduleTask: "schedule_task",
   scheduleCronTask: "schedule_cron_task",
   scheduleOnceTask: "schedule_once_task",
+  scheduleSelfPaced: "schedule_self_paced_task",
   listTasks: "list_scheduled_tasks",
   deleteTask: "delete_scheduled_task",
   scheduleWakeup: "schedule_wakeup",
@@ -158,6 +167,16 @@ export function summarizeTask(task: ScheduledTask): ScheduledTaskSummary {
 export interface ScheduleOnceResult {
   ok: true;
   task: ScheduledTaskSummary;
+}
+
+/** The result of creating an independent self-paced task. */
+export interface ScheduleSelfPacedResult {
+  ok: true;
+  task: ScheduledTaskSummary;
+  /** Effective fallback wakeup delay after the 1min–1h clamp. */
+  fallbackDelayMs: number;
+  /** True when the requested `fallbackDelay` was clamped into range. */
+  fallbackClamped: boolean;
 }
 
 function textResult<T>(text: string, details: T): AgentToolResult<T> {
@@ -276,6 +295,19 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
       Type.String({
         description:
           "Run once at this absolute ISO-8601 timestamp with an explicit offset or Z (for example \"2026-10-01T09:00:00-04:00\"). Exactly one of at or delay must be given, and the time must be in the future.",
+      }),
+    ),
+  });
+
+  const ScheduleSelfPacedParams = Type.Object({
+    prompt: Type.String({
+      description:
+        "Prompt text delivered as a user message on every run. Plain text, a prompt template, or a known /skill: command.",
+    }),
+    fallbackDelay: Type.Optional(
+      Type.String({
+        description:
+          "Optional fallback wakeup delay as a positive number plus a unit (for example \"5min\"). Used once if an iteration neither reschedules nor stops. Clamped into 1 minute–1 hour like the /loop fallback; defaults to 1min.",
       }),
     ),
   });
@@ -403,6 +435,48 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     },
   };
 
+  const scheduleSelfPacedTask: ToolDefinition<
+    typeof ScheduleSelfPacedParams,
+    ScheduleSelfPacedResult
+  > = {
+    name: SCHEDULER_TOOL_NAMES.scheduleSelfPaced,
+    label: "Schedule Self-Paced Task",
+    description:
+      "Mutating. Create an independent self-paced task: its first run is due immediately, and each iteration chooses its own next wakeup with schedule_wakeup or ends itself with stop_wakeup. Never replaces the /loop command loop or another self-paced task; not persisted across reloads. Returns the stable task ID. Throws for an invalid prompt or fallbackDelay.",
+    promptSnippet: "Create an independent self-paced task whose first run is due now",
+    promptGuidelines: [
+      "schedule_self_paced_task runs alongside the /loop command loop and other self-paced tasks; it never replaces them. Use list_scheduled_tasks to see IDs and delete_scheduled_task to cancel one.",
+      "Reschedule the self-paced iteration that is currently executing with schedule_wakeup, or end it with stop_wakeup; those tools are iteration-scoped and fail outside a running iteration.",
+    ],
+    parameters: ScheduleSelfPacedParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<AgentToolResult<ScheduleSelfPacedResult>> {
+      const prompt = requirePrompt(params.prompt);
+      classify(prompt);
+      // Same validation (parseInterval) and clamp (scheduleSelfPaced, echoed
+      // here for the result) as the command-owned self-paced loop.
+      const requestedFallbackMs =
+        params.fallbackDelay === undefined ? undefined : parseInterval(params.fallbackDelay);
+      const task = scheduler.scheduleSelfPaced(
+        prompt,
+        requestedFallbackMs === undefined ? {} : { fallbackDelayMs: requestedFallbackMs },
+      );
+      const summary = summarizeTask(registry.get(task.id) ?? task);
+      const fallbackDelayMs = clampWakeupDelay(requestedFallbackMs ?? DEFAULT_WAKEUP_FALLBACK_MS);
+      changed();
+      return textResult(
+        `Scheduled self-paced task ${summary.id}; first run is due immediately` +
+          `, fallback wakeup in ${formatInterval(fallbackDelayMs)} if no next wakeup is chosen`,
+        {
+          ok: true,
+          task: summary,
+          fallbackDelayMs,
+          fallbackClamped: requestedFallbackMs !== undefined && fallbackDelayMs !== requestedFallbackMs,
+        } satisfies ScheduleSelfPacedResult,
+      );
+    },
+  };
+
   const listTasks: ToolDefinition<typeof ListTasksParams, ListTasksResult> = {
     name: SCHEDULER_TOOL_NAMES.listTasks,
     label: "List Scheduled Tasks",
@@ -472,16 +546,24 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     name: SCHEDULER_TOOL_NAMES.scheduleWakeup,
     label: "Schedule Wakeup",
     description:
-      "Mutating. Choose the next wakeup for the active self-paced loop, clamping the delay to 1 minute–1 hour through the scheduler's wakeup service. Throws when no self-paced loop is running, so it cannot reschedule a fixed task.",
-    promptSnippet: "Choose the next wakeup for the active self-paced loop",
+      "Mutating. Choose the next wakeup for the self-paced iteration that is currently executing, clamping the delay to 1 minute–1 hour through the scheduler's wakeup service. Throws when no self-paced iteration is executing, so it can never reschedule the command-owned loop, a fixed task, or another self-paced task.",
+    promptSnippet: "Choose the next wakeup for the self-paced iteration that is running",
     promptGuidelines: [
-      "schedule_wakeup only applies to the active self-paced loop and clamps the delay to [1min, 1h]; prefer stop_wakeup to end the loop.",
+      "schedule_wakeup only applies to the self-paced iteration that invoked it and clamps the delay to [1min, 1h]; it fails closed outside an executing iteration. Prefer stop_wakeup to end the iteration.",
     ],
     parameters: ScheduleWakeupParams,
     executionMode: "sequential",
     async execute(_toolCallId, params): Promise<AgentToolResult<ScheduleWakeupResult>> {
       if (typeof params.delayMs !== "number") {
         throw new Error("delayMs must be a number of milliseconds");
+      }
+      // Bind to the iteration that is actually executing. This deliberately does
+      // not use `activeSelfPacedTask`, which also resolves the command-owned loop
+      // outside a run; a call made outside an iteration must fail closed.
+      if (scheduler.executingSelfPacedTask() === undefined) {
+        throw new WakeupError(
+          "no self-paced loop is running: schedule_wakeup only applies to the self-paced iteration that is currently executing",
+        );
       }
       const decision = scheduler.scheduleNextWakeup(params.delayMs, params.reason);
       changed();
@@ -506,35 +588,48 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     name: SCHEDULER_TOOL_NAMES.stopWakeup,
     label: "Stop Self-Paced Loop",
     description:
-      "Mutating. Stop the active self-paced loop and cancel all of its future wakeups. Throws when no self-paced loop is running; fixed tasks and tool-created tasks are unaffected.",
-    promptSnippet: "Stop the active self-paced loop and its wakeups",
+      "Mutating. Stop the self-paced iteration that is currently executing and cancel all of its future wakeups. Throws when no self-paced iteration is executing, so it never stops the command-owned loop, a fixed task, or another self-paced task.",
+    promptSnippet: "Stop the self-paced iteration that is running and its wakeups",
     promptGuidelines: [
-      "stop_wakeup is valid only for the active self-paced loop; it does not stop fixed scheduled tasks (use delete_scheduled_task).",
+      "stop_wakeup is valid only for the self-paced iteration that invoked it; it does not stop fixed scheduled tasks or other self-paced tasks (use delete_scheduled_task for those).",
     ],
     parameters: StopWakeupParams,
     executionMode: "sequential",
     async execute(): Promise<AgentToolResult<StopWakeupResult>> {
-      // Scope the tool to the self-paced iteration that is executing now (or the
-      // command-owned self-paced loop outside a run). Independent self-paced tasks
-      // are only stoppable while their own iteration is active, so this never
-      // cancels a different task by accident.
-      const active = scheduler.activeSelfPacedTask();
-      if (active === undefined) {
-        throw new Error("no self-paced loop is running");
+      // Scope the tool to the self-paced iteration that is executing now. Unlike
+      // `activeSelfPacedTask`, this never falls back to the command-owned loop, so
+      // a stop outside an iteration (including one where only the command-owned
+      // self-paced loop exists) fails closed instead of cancelling the primary.
+      const executing = scheduler.executingSelfPacedTask();
+      if (executing === undefined) {
+        throw new WakeupError(
+          "no self-paced loop is running: stop_wakeup only applies to the self-paced iteration that is currently executing",
+        );
       }
       const stopped = scheduler.stop();
       if (!stopped) {
-        throw new Error("no self-paced loop is running");
+        throw new WakeupError(
+          "no self-paced loop is running: stop_wakeup only applies to the self-paced iteration that is currently executing",
+        );
       }
       changed();
       return textResult(
-        `Stopped self-paced loop${active.prompt ? `: ${active.prompt}` : ""}`,
-        { ok: true, id: active.id, prompt: active.prompt } satisfies StopWakeupResult,
+        `Stopped self-paced loop${executing.prompt ? `: ${executing.prompt}` : ""}`,
+        { ok: true, id: executing.id, prompt: executing.prompt } satisfies StopWakeupResult,
       );
     },
   };
 
-  return [scheduleTask, scheduleCronTask, scheduleOnceTask, listTasks, deleteTask, scheduleWakeup, stopWakeup];
+  return [
+    scheduleTask,
+    scheduleCronTask,
+    scheduleOnceTask,
+    scheduleSelfPacedTask,
+    listTasks,
+    deleteTask,
+    scheduleWakeup,
+    stopWakeup,
+  ];
 }
 
 /** Register every scheduler tool on a Pi instance. */

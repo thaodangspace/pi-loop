@@ -51,6 +51,10 @@ conversation while the session stays open.
   (for example `0 9 * * 1-5`), and `schedule_once_task` runs a prompt once. Both
   share the same scheduler, registry, due queue, and persistence. See
   [Cron and one-shot schedules](#cron-and-one-shot-schedules).
+- `schedule_self_paced_task` creates an **independent** self-paced task: its
+  first run is due immediately, and each iteration paces itself exactly like a
+  prompt-only `/loop` — without replacing the command-owned loop or any other
+  self-paced task. See [Model-callable tools](#model-callable-tools).
 
 ### Self-paced loops
 
@@ -75,19 +79,24 @@ misses coalesce into a single run rather than replaying a backlog.
 
 Self-paced control is scoped to the iteration that is actually executing. Pi
 runs one agent turn at a time, so while an iteration is active the scheduler
-binds it and `schedule_wakeup`/`stop_wakeup` (and the scheduler's own
-`scheduleNextWakeup`/`stop`/`settleIteration`) resolve to that task; outside a
-run they fall back to the command-owned loop. A binding whose task disappears
-while its turn is running (including a delete or `stopTask`) fails closed: the
-late wakeup/stop never retargets the command loop, and the binding is released
-only at the turn boundary (`settleIteration`). `/loop stop` uses the separate,
+binds it and the model-callable `schedule_wakeup`/`stop_wakeup` resolve to that
+task; the scheduler's own `scheduleNextWakeup`/`stop`/`settleIteration` do the
+same. Outside an executing iteration the tools fail closed — even when a
+command-owned self-paced loop exists — so a wakeup or stop can never retarget the
+primary loop or another task. A binding whose task disappears while its turn is
+running (including a delete or `stopTask`) also fails closed: the late
+wakeup/stop never retargets the command loop, and the binding is released only at
+the turn boundary (`settleIteration`). `/loop stop` uses the separate,
 command-only `scheduler.stopCommandLoop()`, so it always cancels the
-command-owned loop and never an executing independent task. A host can also create independent
-self-paced tasks with `scheduleSelfPaced(prompt, options)`, which never replaces
-the command-owned loop: each task keeps its own fallback allowance, wakeup, and
-run token, so settling or stopping one can never reschedule, terminate, or stop
-another. A due task that arrives while another iteration is active is queued and
-runs at the next idle boundary in the documented due order.
+command-owned loop and never an executing independent task. A host (or the
+`schedule_self_paced_task` tool) can create independent self-paced tasks with
+`scheduleSelfPaced(prompt, options)`, which never replaces the command-owned
+loop: each task keeps its own fallback allowance, wakeup, and run token, so
+settling or stopping one can never reschedule, terminate, or stop another. A due
+task that arrives while another iteration is active is queued and runs at the
+next idle boundary in the documented due order. Self-paced tasks are ephemeral:
+neither the command-owned loop's wakeup state nor an independent task is
+persisted across reload/resume.
 
 The wakeup service is scheduler state, not a prompt-text convention. The
 model-facing operations that call it (`schedule_wakeup` and `stop_wakeup`) and
@@ -338,12 +347,16 @@ changing it.
   old one and cancels its timer. Behind the command, the scheduler tracks that
   command-owned loop as a `fixed` or `self-paced` task in a per-session task
   registry with a stable ID, its timing state, and a computed `nextFireAt`. The
-  scheduler can also track independent fixed tasks via `scheduleFixed`, and each
-  task keeps its own timer and due-queue entry.
+  scheduler can also track independent fixed tasks via `scheduleFixed` and
+  independent self-paced tasks via `scheduleSelfPaced` (the model-callable
+  `schedule_task` and `schedule_self_paced_task`), and each task keeps its own
+  timer and due-queue entry.
 - **Self-paced wakeups are relative and clamped.** A self-paced iteration's
   requested delay is measured from when it asks, clamped into 1 minute–1 hour,
   and stored with an optional reason. A missing choice gets one bounded fallback
-  wakeup; a second consecutive miss terminates the loop.
+  wakeup; a second consecutive miss terminates the loop. `schedule_wakeup` and
+  `stop_wakeup` apply only to the iteration that is currently executing; outside
+  one they fail closed rather than targeting the command-owned loop.
 - **Missed runs coalesce; no backlog.** If Pi is busy when a boundary or wakeup
   is due, the scheduler marks the task in its own due queue and delivers one run
   once Pi is idle again. Repeated misses for the same task coalesce, and distinct
@@ -447,7 +460,7 @@ closed is **dropped, never replayed**, on resume.
 
 ## Model-callable tools
 
-Alongside the `/loop` command, the extension registers seven model-callable tools.
+Alongside the `/loop` command, the extension registers eight model-callable tools.
 They operate on the **same session-scoped task registry and scheduler** as
 `/loop`, so a task created by a tool appears in the registry, participates in the
 same due queue and timers, and is persisted the same way. When scheduling is
@@ -459,27 +472,40 @@ disabled with `PI_LOOP_DISABLE` (see
 | `schedule_task` | Mutating | Create a recurring fixed task from `interval`, `prompt`, and an optional `expiresIn`. Returns the stable task ID. |
 | `schedule_cron_task` | Mutating | Create a recurring task from a 5-field local-time `cron` expression, optional `timeZone`, and optional `expiresIn`. Invalid fields are reported. |
 | `schedule_once_task` | Mutating | Create a task that fires once from either `delay` or an absolute `at` timestamp, then removes itself. |
+| `schedule_self_paced_task` | Mutating | Create an **independent** self-paced task from `prompt` and an optional `fallbackDelay`. Its first run is due immediately; each iteration chooses its own wakeup. Never replaces the command loop. Returns the stable task ID. |
 | `list_scheduled_tasks` | Read-only | List active tasks with ID, mode, cadence/cron, next fire time, expiry, and pending status. |
 | `delete_scheduled_task` | Mutating | Delete one task by its stable ID, cancelling its timer and any queued run. |
-| `schedule_wakeup` | Mutating | Choose the next wakeup of the active self-paced loop from `delayMs` and an optional `reason`; the scheduler clamps to 1 minute–1 hour. |
-| `stop_wakeup` | Mutating | Stop the active self-paced loop and cancel its future wakeups. |
+| `schedule_wakeup` | Mutating | Choose the next wakeup of the self-paced iteration that is **currently executing**, from `delayMs` and an optional `reason`; the scheduler clamps to 1 minute–1 hour. Throws outside an executing iteration. |
+| `stop_wakeup` | Mutating | Stop the self-paced iteration that is **currently executing** and cancel its future wakeups. Throws outside an executing iteration. |
 
 Coherence with `/loop`:
 
-- Tool-created tasks (interval, cron, and one-shot) are **independent** of the
-  command-owned loop: they never replace the loop, and `stop_wakeup` and
-  `/loop stop` never cancel them. Use `delete_scheduled_task` for those.
+- Tool-created tasks (interval, cron, one-shot, and independent self-paced) are
+  **independent** of the command-owned loop: they never replace the loop, and
+  `stop_wakeup` and `/loop stop` never cancel them. Use
+  `delete_scheduled_task` for those.
 - `/loop status` prints the command-owned loop summary and then lists **every**
   task (its ID, mode, cadence/cron, next due/wakeup, and queued state), so the
   same information is visible without calling `list_scheduled_tasks`.
-- `schedule_wakeup` and `stop_wakeup` are scoped to the **active self-paced
-  loop** and throw when no such loop is running, so they cannot reschedule or
-  cancel a fixed task.
+- `schedule_wakeup` and `stop_wakeup` are scoped to the self-paced iteration
+  that is **actually executing** and throw when there is none, so they cannot
+  reschedule or cancel the command-owned loop, a fixed task, or another
+  independent self-paced task. The model does not pass a task ID to them: the
+  scheduler binds the active iteration, which is what keeps a wakeup from task A
+  from ever affecting task B.
+- An independent self-paced task's first iteration is due **immediately** and
+  uses the same idle/due-queue rules as `/loop`: if Pi is busy it is queued and
+  delivered once when idle, and repeated misses coalesce. Its optional
+  `fallbackDelay` uses the same parser and 1 minute–1 hour clamp as the
+  command-owned fallback, and `delete_scheduled_task` cancels it safely from
+  outside an iteration.
 
 Validation and safety boundaries:
 
-- Intervals and `expiresIn` use the same parser as `/loop` (`s`, `min`, `h`,
-  `d`; positive whole numbers). Malformed values throw and change nothing.
+- Intervals, `expiresIn`, and a self-paced `fallbackDelay` use the same parser as
+  `/loop` (`s`, `min`, `h`, `d`; positive whole numbers). Malformed values throw
+  and change nothing. A `fallbackDelay` outside 1 minute–1 hour is clamped, and
+  the clamped value is returned.
 - A cron expression is validated field by field; the thrown error names the
   offending component (`minute`, `hour`, `day-of-month`, `month`, `day-of-week`,
   `timezone`, or the expression itself). An unknown timezone is rejected.
@@ -534,7 +560,7 @@ The logic is split so it can be tested without Pi:
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
-| `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
+| `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `schedule_self_paced_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
 | `src/index.ts` | Pi wiring: command, tool registration (skipped when disabled), persistent status/widget, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
@@ -553,7 +579,9 @@ reschedule, clamp, bounded-fallback, termination, and stale-callback paths.
 Multi-task self-paced coverage adds two independent tasks with distinct wakeups,
 per-task fallback counters and termination, iteration-scoped stop/delete, busy
 coalescing and earliest-deadline flush order, cross-task stale async failures,
-and command-owned replacement that preserves independent tasks.
+the executing-iteration query that distinguishes an active iteration from the
+command-owned loop, and command-owned replacement that preserves independent
+tasks.
 Due-queue coverage adds per-task coalescing, deterministic flush order for two
 distinct tasks and simultaneous deadlines, long busy windows, deleted/stopped
 tasks and stale callbacks, and flush reentrancy when a dispatch starts work.
@@ -578,7 +606,11 @@ or entries. Tool coverage adds the registration contract (distinct names,
 TypeBox schemas, read-only vs mutating metadata, sequential execution), fixed
 creation/firing/expiry, malformed interval/prompt/control-prompt rejection, the
 task limit, exact-ID deletion and unknown-ID not-found, pending-run cancellation,
-read-only listing, self-paced clamp/reschedule/stop, and `/loop`/tool registry
+read-only listing, self-paced clamp/reschedule/stop, independent self-paced
+creation with distinct IDs and an immediate first run, two independent tasks with
+their own wakeups and stop, fail-closed wakeup/stop outside an executing
+iteration (including a command-owned primary), self-paced deletion and fallback
+clamping, coexistence with fixed/cron/one-shot tasks, and `/loop`/tool registry
 coherence and restore. Cron coverage adds deterministic per-field parsing and
 validation (including the named field on an error), the DOM/DOW OR rule,
 local-time resolution in an injected zone, DST spring-forward gaps and fall-back
