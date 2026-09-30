@@ -6,6 +6,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  footerStatus,
+  formatClockTime,
   formatCountdown,
   formatStatusLine,
   formatTaskLine,
@@ -65,21 +67,78 @@ test("formatTaskLine renders ID, mode, cadence, next and pending", () => {
   assert.match(oneShot, /^t5 · \[one-shot\] · next due now: check deploy$/);
 });
 
-test("formatStatusLine reports count, soonest next, and pending total", () => {
-  assert.equal(formatStatusLine([], 0), "loop: 0 tasks");
+test("formatClockTime renders an absolute instant as local wall-clock time", () => {
+  // Build from local components so the expectation is timezone-independent.
+  const nine = new Date(2026, 8, 30, 9, 0, 0).getTime();
+  const nineFive = new Date(2026, 8, 30, 9, 5, 0).getTime();
+  const endOfDay = new Date(2026, 8, 30, 23, 59, 0).getTime();
+  assert.equal(formatClockTime(nine), "09:00");
+  assert.equal(formatClockTime(nineFive), "09:05");
+  assert.equal(formatClockTime(endOfDay), "23:59");
+  assert.equal(formatClockTime(Number.NaN), undefined);
+  assert.equal(formatClockTime(Number.POSITIVE_INFINITY), undefined);
+});
+
+test("footerStatus projects total, per-mode counts, and the earliest known next fire", () => {
+  const model = footerStatus([
+    task({ id: "t1", mode: "fixed", nextFireAt: 600_000 }),
+    task({ id: "t2", mode: "fixed" }),
+    task({ id: "t3", mode: "self-paced", nextFireAt: 300_000 }),
+    task({ id: "t4", mode: "one-shot", nextFireAt: Number.NaN }),
+  ]);
+  assert.equal(model.total, 4);
+  assert.deepEqual(model.counts, { fixed: 2, selfPaced: 1, oneShot: 1 });
+  assert.equal(model.nextFireAt, 300_000, "the earliest finite nextFireAt wins");
+
+  const empty = footerStatus([]);
+  assert.equal(empty.total, 0);
+  assert.equal(empty.nextFireAt, undefined, "no next fire time when there is nothing to time");
+});
+
+test("formatStatusLine renders a compact one-line footer with local next time", () => {
+  const nine = new Date(2026, 8, 30, 9, 0, 0).getTime();
+
+  assert.equal(formatStatusLine([]), "⟳ 0 loops");
   assert.equal(
-    formatStatusLine([task({ nextFireAt: 300_000 })], 0),
-    "loop: 1 task · next in 5min",
+    formatStatusLine([task({ nextFireAt: nine })]),
+    "⟳ 1 loop · next 09:00",
+  );
+  assert.equal(formatStatusLine([task()]), "⟳ 1 loop", "no next time when none is known");
+  assert.equal(
+    formatStatusLine([task({ nextFireAt: nine, pending: true })]),
+    "⟳ 1 loop · next 09:00",
+    "a pending run stays one footer line and adds no marker",
+  );
+
+  assert.equal(
+    formatStatusLine([
+      task({ id: "t1", mode: "fixed", nextFireAt: nine }),
+      task({ id: "t2", mode: "fixed", nextFireAt: nine + 60_000 }),
+      task({ id: "t3", mode: "self-paced", nextFireAt: nine + 120_000 }),
+    ]),
+    "⟳ 3 loops · 2 fixed · 1 self-paced · next 09:00",
   );
   assert.equal(
-    formatStatusLine(
-      [
-        task({ id: "t1", nextFireAt: 600_000, pending: true }),
-        task({ id: "t2", nextFireAt: 300_000 }),
-      ],
-      0,
-    ),
-    "loop: 2 tasks · next in 5min · 1 pending",
+    formatStatusLine([
+      task({ id: "t1", mode: "fixed", nextFireAt: nine }),
+      task({ id: "t2", mode: "one-shot", nextFireAt: nine + 30_000 }),
+    ]),
+    "⟳ 2 loops · 1 fixed · 1 one-shot · next 09:00",
+  );
+  assert.equal(
+    formatStatusLine([
+      task({ id: "t1", mode: "fixed", nextFireAt: nine }),
+      task({ id: "t2", mode: "fixed", nextFireAt: nine + 60_000 }),
+    ]),
+    "⟳ 2 loops · 2 fixed · next 09:00",
+  );
+  assert.equal(
+    formatStatusLine([
+      task({ id: "t1" }),
+      task({ id: "t2", nextFireAt: nine }),
+    ]),
+    "⟳ 2 loops · 2 fixed · next 09:00",
+    "tasks without a next time still count and the earliest known one is shown",
   );
 });
 

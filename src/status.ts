@@ -5,9 +5,11 @@
  * The extension renders two surfaces from one snapshot of the authoritative task
  * registry:
  *
- * - a one-line footer status (active count plus the soonest due time), and
- * - a compact widget listing every task with its ID, mode, cadence, next due or
- *   wakeup, and queued state.
+ * - a compact one-line footer status (`⟳ 3 loops · 2 fixed · 1 self-paced ·
+ *   next 09:00`: active count, per-mode counts when multiple tasks, and the
+ *   earliest known next fire time as a local clock time), and
+ * - a widget listing every task with its ID, mode, cadence, next due or wakeup,
+ *   and queued state.
  *
  * `/loop status` reuses the same per-task line so the command copy and the
  * on-screen copy never drift. Nothing here imports the Pi runtime or touches the
@@ -95,24 +97,86 @@ export function formatTaskLines(tasks: readonly ScheduledTask[], now: number): s
 }
 
 /**
- * The compact footer status: active count, soonest due/wakeup, and how many runs
- * are queued. The caller clears the status instead when there are no tasks.
+ * Local clock time (`HH:MM`, 24-hour) for an absolute instant, or undefined for
+ * a non-finite time. The footer shows when a task is next due as a wall-clock
+ * time rather than a countdown, so it stays a stable projection on every repaint.
  */
-export function formatStatusLine(tasks: readonly ScheduledTask[], now: number): string {
-  const count = tasks.length;
-  const segments = [`${count} task${count === 1 ? "" : "s"}`];
-  let soonest: number | undefined;
+export function formatClockTime(at: number): string | undefined {
+  if (!Number.isFinite(at)) {
+    return undefined;
+  }
+  const date = new Date(at);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}:${minutes}`;
+}
+
+/** Per-mode active-task counts for the footer, keyed by registry mode. */
+export interface FooterCounts {
+  readonly fixed: number;
+  readonly selfPaced: number;
+  readonly oneShot: number;
+}
+
+/**
+ * A pure projection of the registry tasks for the footer: the total, the
+ * per-mode counts, and the earliest known `nextFireAt` (or undefined when no
+ * active task has one). Tasks without a computed next fire time still count.
+ */
+export interface FooterStatus {
+  readonly total: number;
+  readonly counts: FooterCounts;
+  readonly nextFireAt?: number;
+}
+
+/** Derive the footer projection from the authoritative task snapshots. */
+export function footerStatus(tasks: readonly ScheduledTask[]): FooterStatus {
+  let fixed = 0;
+  let selfPaced = 0;
+  let oneShot = 0;
+  let nextFireAt: number | undefined;
   for (const task of tasks) {
-    if (task.nextFireAt !== undefined && (soonest === undefined || task.nextFireAt < soonest)) {
-      soonest = task.nextFireAt;
+    if (task.mode === "fixed") fixed += 1;
+    else if (task.mode === "self-paced") selfPaced += 1;
+    else if (task.mode === "one-shot") oneShot += 1;
+    const at = task.nextFireAt;
+    if (at !== undefined && Number.isFinite(at)) {
+      if (nextFireAt === undefined || at < nextFireAt) {
+        nextFireAt = at;
+      }
     }
   }
-  if (soonest !== undefined) {
-    segments.push(`next ${formatCountdown(now, soonest)}`);
+  return {
+    total: tasks.length,
+    counts: { fixed, selfPaced, oneShot },
+    ...(nextFireAt === undefined ? {} : { nextFireAt }),
+  };
+}
+
+/**
+ * The compact, single-line footer status: a loop glyph, the total active task
+ * count, the per-mode counts when more than one task is active, and the
+ * earliest known next fire time as a local clock time. The caller clears the
+ * status instead when there are no tasks.
+ *
+ * Examples:
+ * - no tasks: the caller clears the footer instead of rendering
+ * - `⟳ 1 loop · next 09:00`
+ * - `⟳ 3 loops · 2 fixed · 1 self-paced · next 09:00`
+ * - `⟳ 1 loop` (no active task has a computed next fire time)
+ */
+export function formatStatusLine(tasks: readonly ScheduledTask[]): string {
+  const model = footerStatus(tasks);
+  const segments = [`⟳ ${model.total} loop${model.total === 1 ? "" : "s"}`];
+  if (model.total > 1) {
+    const { fixed, selfPaced, oneShot } = model.counts;
+    if (fixed > 0) segments.push(`${fixed} fixed`);
+    if (selfPaced > 0) segments.push(`${selfPaced} self-paced`);
+    if (oneShot > 0) segments.push(`${oneShot} one-shot`);
   }
-  const pending = tasks.filter((task) => task.pending).length;
-  if (pending > 0) {
-    segments.push(`${pending} pending`);
+  const next = model.nextFireAt === undefined ? undefined : formatClockTime(model.nextFireAt);
+  if (next !== undefined) {
+    segments.push(`next ${next}`);
   }
-  return `loop: ${segments.join(" · ")}`;
+  return segments.join(" · ");
 }
