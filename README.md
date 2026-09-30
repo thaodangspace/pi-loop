@@ -35,8 +35,10 @@ conversation while the session stays open.
   `90m` → `2h`). Claude-style boundaries are honored, so a `5min` loop started
   at 12:03 first runs at 12:05.
 - `/loop stop` cancels the loop and any queued run.
-- `/loop status` reports the active task, whether it is self-paced or fixed, the
-  effective interval, and whether a run is queued or a wakeup is pending.
+- `/loop status` reports the command-owned loop, then lists **every** tracked
+  task with its stable ID, mode, cadence or cron, next due/wakeup, and whether a
+  run is queued. Independent tasks created by the model-callable tools are
+  therefore visible alongside the loop.
 - Bare `/loop` and interval-only `/loop <n><unit>` are **maintenance** loops:
   they run a maintenance prompt rather than one you type. Bare `/loop` is
   self-paced; `/loop <n><unit>` runs on a fixed schedule. See
@@ -164,14 +166,20 @@ pending, without starting unrelated work or taking irreversible actions.
 
 ## Requirements
 
-- Pi `0.87` or newer (developed and smoke-tested against `0.87.1`).
-- Node 22+ for development and tests.
+- Pi `0.87.1` or newer. The `package.json` peer range is `>=0.87.1`, this is the
+  version the extension is developed and smoke-tested against, and CI typechecks
+  and tests the declared minimum (`0.87.1`) and the newest published line
+  (`0.99.1`) on every push and pull request. A version outside that range is not
+  claimed to work.
+- Node `22.19.0` or newer (`package.json` `engines`), matching Pi's own
+  requirement.
 
 The extension uses only the documented Pi extension API (`registerCommand`,
 `getCommands`, `sendUserMessage`, `appendEntry`, `ctx.isIdle()`,
-`ctx.sessionManager.getBranch()`, and the `session_start` / `session_tree` /
-`agent_start` / `agent_settled` / `session_shutdown` events). It does not spawn
-processes or timers at load; a timer exists only while a loop is active.
+`ctx.sessionManager.getBranch()`, `ctx.hasUI`, `ctx.ui.setStatus` /
+`ctx.ui.setWidget`, and the `session_start` / `session_tree` / `agent_start` /
+`agent_settled` / `session_shutdown` events). It does not spawn processes or
+timers at load; a timer exists only while a loop is active.
 
 ## Install
 
@@ -218,6 +226,55 @@ ignore the file.
   reads the config.
 - These override paths/values are honoured: `PI_CODING_AGENT_DIR` moves the
   agent directory, and `PI_LOOP_CONFIG` points directly at a config file.
+
+## Runtime visibility
+
+While any task is scheduled, the extension paints two persistent surfaces from
+the authoritative registry (never a separate copy):
+
+- a **footer status** with the active count, the soonest due/wakeup, and how
+  many runs are queued, for example `loop: 2 tasks · next in 5min · 1 pending`;
+- a **widget** below the editor with one line per task, for example
+  `t2 · [fixed] · every 10min · next in 8min: check deploy`, including the
+  `pending` marker while a run waits for the next idle moment.
+
+Both surfaces are repainted after every state change: a create/delete/stop from
+`/loop` or a tool, a timer tick (including a busy tick that queues a run), a
+self-paced reschedule or fallback, a restore, and shutdown. With no tasks left
+they are cleared. The surfaces are only used when the client has a UI
+(`ctx.hasUI`, i.e. TUI and RPC modes); JSON and print modes are untouched, and
+tools and event behavior keep working without rendering.
+
+`/loop status` prints the same per-task lines so the command copy and the
+on-screen copy never drift.
+
+## Disable scheduling
+
+Set the environment variable `PI_LOOP_DISABLE` to disable the whole scheduler for
+the process:
+
+```bash
+PI_LOOP_DISABLE=1 pi --extension ./src/index.ts
+```
+
+Explicit semantics: scheduling is disabled **only** when the value is one of
+`1`, `true`, `yes`, or `on` (case-insensitive, surrounding whitespace ignored).
+Any other value — `0`, `false`, `no`, `off`, an empty string, or an unset
+variable — leaves scheduling enabled; there is no implicit truthiness.
+
+When disabled:
+
+- **No scheduling tool is registered.** The model cannot create, list, or delete
+  scheduled tasks. `/loop` still loads and explains that scheduling is disabled
+  (every invocation reports the switch, whatever its arguments).
+- **No timers start, including on restore.** A resumed session's persisted tasks
+  are not reconstructed, so nothing can fire.
+- Nothing is written to session history, and the status/widget are cleared.
+
+The check happens once at extension load from the environment, or from an
+explicit `disabled` dependency when an embedding host supplies one. It is a
+startup switch, not a live toggle: reload the extension (or restart Pi) after
+changing it.
 
 ## Behavior and limits
 
@@ -367,7 +424,9 @@ closed is **dropped, never replayed**, on resume.
 Alongside the `/loop` command, the extension registers seven model-callable tools.
 They operate on the **same session-scoped task registry and scheduler** as
 `/loop`, so a task created by a tool appears in the registry, participates in the
-same due queue and timers, and is persisted the same way.
+same due queue and timers, and is persisted the same way. When scheduling is
+disabled with `PI_LOOP_DISABLE` (see
+[Disable scheduling](#disable-scheduling)) **no tool is registered at all**.
 
 | Tool | Kind | Purpose |
 |---|---|---|
@@ -384,8 +443,9 @@ Coherence with `/loop`:
 - Tool-created tasks (interval, cron, and one-shot) are **independent** of the
   command-owned loop: they never replace the loop, and `stop_wakeup` and
   `/loop stop` never cancel them. Use `delete_scheduled_task` for those.
-- `/loop status` keeps describing the command-owned loop only; use
-  `list_scheduled_tasks` to see every task.
+- `/loop status` prints the command-owned loop summary and then lists **every**
+  task (its ID, mode, cadence/cron, next due/wakeup, and queued state), so the
+  same information is visible without calling `list_scheduled_tasks`.
 - `schedule_wakeup` and `stop_wakeup` are scoped to the **active self-paced
   loop** and throw when no such loop is running, so they cannot reschedule or
   cancel a fixed task.
@@ -427,7 +487,12 @@ work. Task text appears in the session transcript, so avoid secrets in the task.
 npm install
 npm run typecheck     # tsc --noEmit
 npm test              # tsx --test test/*.test.ts
+git diff --check      # whitespace check
 ```
+
+CI (`.github/workflows/ci.yml`) runs typecheck and tests on every push and pull
+request against the declared minimum Pi (`0.87.1`) and the newest published line
+(`0.99.1`), so a breaking Pi API change fails the build instead of shipping.
 
 The logic is split so it can be tested without Pi:
 
@@ -438,17 +503,21 @@ The logic is split so it can be tested without Pi:
 | `src/schedule.ts` | Fixed schedules: cadence normalization (cron granularity and clean steps), `nextFireAt` boundary calculation, the FNV-1a ID hash with bounded jitter offsets, the default seven-day task lifetime, and the `TaskSchedule` union that dispatches interval vs cron. |
 | `src/cron.ts` | Pure 5-field cron: per-field parsing/validation (wildcard, value, step, range, list, names), the documented DOM/DOW OR rule, timezone-aware next-occurrence calculation with DST gap/overlap handling, and a bounded search. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
-| `src/config.ts` | `loop.json` resolution with an injectable file reader. |
+| `src/config.ts` | `loop.json` resolution with an injectable file reader, and the `PI_LOOP_DISABLE` switch (`isLoopDisabled`). |
+| `src/status.ts` | Pure formatting for the persistent status/widget and `/loop status`: countdowns, per-task lines (ID, mode, cadence, next due/wakeup, pending), and the compact footer summary. |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
 | `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
-| `src/index.ts` | Pi wiring: command, tool registration, idle events, per-run prompt resolution, and lifecycle cleanup. |
+| `src/index.ts` | Pi wiring: command, tool registration (skipped when disabled), persistent status/widget, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves
 timers overdue), a deterministic registry factory, and a fake Pi API whose
-`sendUserMessage` reproduces Pi's expansion semantics (a matching extension
-command executes; skills and templates expand; otherwise the text is literal).
+`sendUserMessage` reproduces Pi's semantics: it returns `void`, applies the same
+expansion rules (a matching extension command executes; skills and templates
+expand; otherwise the text is literal), and — like Pi — catches a simulated
+delivery failure internally instead of throwing, so tests never assume the
+scheduler can observe or retry a send failure.
 The virtual clock disables task-ID jitter by default so boundary/grid suites
 assert the underlying schedule; jitter suites override `jitterOffset` with the
 real hash. Scheduler and adapter tests never sleep — they drive time explicitly
@@ -485,7 +554,12 @@ validation (including the named field on an error), the DOM/DOW OR rule,
 local-time resolution in an injected zone, DST spring-forward gaps and fall-back
 overlaps, an impossible-schedule bound, cron scheduler firing/coalescing/
 recompute-on-restore/expiry, far-future occurrences beyond the `setTimeout`
-cap, and a missed one-shot being dropped on restore.
+cap, and a missed one-shot being dropped on restore. Visibility/disable coverage
+adds countdown and per-task-line formatting, the persistent status/widget
+populated on create and cleared on stop/shutdown, busy-tick and non-UI guards,
+and the disable switch (pure env parsing plus an injected switch: no tools, no
+timers, no restore, `/loop` explaining the disabled state, and tools/restore
+still working when enabled).
 
 ### Live smoke test
 

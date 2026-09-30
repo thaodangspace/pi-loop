@@ -9,12 +9,14 @@
  * due queue, and one set of timers, so `/loop status`, `/loop stop`, and the
  * tools stay coherent.
  *
- * Contract notes (installed `@earendil-works/pi-coding-agent` 0.87.1):
+ * Contract notes (the declared minimum `@earendil-works/pi-coding-agent`
+ * 0.87.1; also verified against 0.99.1, whose optional `annotations` field is
+ * deliberately unused so the same source typechecks on both):
  *
- * - `ToolDefinition` has no `annotations`/`readOnlyHint` field. Read-only vs
- *   mutating intent is expressed through the model-facing description prefix,
- *   `promptGuidelines`, and `executionMode: "sequential"` (the tools share
- *   mutable scheduler state).
+ * - The minimum `ToolDefinition` has no `annotations`/`readOnlyHint` field.
+ *   Read-only vs mutating intent is expressed through the model-facing
+ *   description prefix, `promptGuidelines`, and `executionMode: "sequential"`
+ *   (the tools share mutable scheduler state).
  * - Pi's contract is "throw from `execute()` to produce a failed tool result"
  *   (`docs/extensions.md`). Unknown IDs, invalid intervals/prompts, the task
  *   limit, and wakeup misuse therefore throw typed errors; successful calls
@@ -124,6 +126,12 @@ export interface SchedulerToolDeps {
    * cannot schedule a task that could never be delivered.
    */
   classifyPrompt?: (prompt: string) => ScheduledPromptDecision;
+  /**
+   * Called after every successful mutation so the host can refresh its visible
+   * state (for example the persistent status/widget). Never called for the
+   * read-only `list_scheduled_tasks`.
+   */
+  onChange?: () => void;
 }
 
 /** Project a registry snapshot into the fields the tools expose. */
@@ -203,6 +211,8 @@ function resolveOneShotTime(params: { delay?: string; at?: string }, now: number
  */
 export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<any, any, any>[] {
   const { scheduler, registry, now } = deps;
+  /** Refresh host-visible state after a successful mutation. */
+  const changed = (): void => deps.onChange?.();
 
   const classify = (prompt: string): void => {
     const decision = deps.classifyPrompt?.(prompt);
@@ -319,6 +329,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
         );
       }
       const summary = summarizeTask(registry.get(task.id) ?? task);
+      changed();
       return textResult(
         `Scheduled task ${summary.id} every ${formatInterval(summary.intervalMs ?? intervalMs)}` +
           (summary.expiresAt === undefined
@@ -355,6 +366,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
         throw new Error("task would expire before its first run; increase expiresIn");
       }
       const summary = summarizeTask(registry.get(task.id) ?? task);
+      changed();
       const expiry =
         summary.expiresAt === undefined
           ? ""
@@ -383,6 +395,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
       const at = resolveOneShotTime(params, now());
       const task = scheduler.scheduleOnce(at, prompt);
       const summary = summarizeTask(registry.get(task.id) ?? task);
+      changed();
       return textResult(
         `Scheduled one-shot task ${summary.id} at ${new Date(at).toISOString()}: ${summary.prompt}`,
         { ok: true, task: summary } satisfies ScheduleOnceResult,
@@ -445,6 +458,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
       if (registry.has(params.id)) {
         registry.delete(params.id);
       }
+      changed();
       return textResult(`Deleted scheduled task ${task.id}${task.prompt ? `: ${task.prompt}` : ""}`, {
         ok: true,
         id: task.id,
@@ -470,6 +484,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
         throw new Error("delayMs must be a number of milliseconds");
       }
       const decision = scheduler.scheduleNextWakeup(params.delayMs, params.reason);
+      changed();
       const text = decision.clamped
         ? `Next wakeup in ${formatInterval(decision.delayMs)} (clamped from ${formatInterval(decision.requestedMs)})`
         : `Next wakeup in ${formatInterval(decision.delayMs)}`;
@@ -511,6 +526,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
       if (!stopped) {
         throw new Error("no self-paced loop is running");
       }
+      changed();
       return textResult(
         `Stopped self-paced loop${active.prompt ? `: ${active.prompt}` : ""}`,
         { ok: true, id: active.id, prompt: active.prompt } satisfies StopWakeupResult,

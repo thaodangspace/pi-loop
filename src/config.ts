@@ -14,6 +14,31 @@ import { IntervalError, parseInterval } from "./loop-core.ts";
 /** Default interval used when no config file exists or it omits `defaultInterval`. */
 export const DEFAULT_INTERVAL_MS = 60_000;
 
+/**
+ * Environment variable that disables all loop scheduling for the process.
+ *
+ * Explicit semantics: scheduling is disabled only when the variable is set to
+ * one of `1`, `true`, `yes`, or `on` (case-insensitive, surrounding whitespace
+ * ignored). Any other value — including `0`, `false`, an empty string, or an
+ * unset variable — leaves scheduling enabled. The check is pure and synchronous
+ * so the extension can decide at load time whether to register any scheduling
+ * tools or start any timers.
+ */
+export const LOOP_DISABLE_ENV = "PI_LOOP_DISABLE";
+
+/** Accepted truthy spellings for the disable switch. */
+const TRUTHY_SWITCH = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Whether scheduling is disabled by the environment.
+ *
+ * See {@link LOOP_DISABLE_ENV} for the exact accepted values.
+ */
+export function isLoopDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[LOOP_DISABLE_ENV];
+  return typeof raw === "string" && TRUTHY_SWITCH.has(raw.trim().toLowerCase());
+}
+
 /** Error for a config file that exists but cannot be trusted. */
 export class LoopConfigError extends Error {
   constructor(message: string) {

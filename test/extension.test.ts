@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createLoopExtension, type LoopExtensionDeps } from "../src/index.ts";
 import { BUILT_IN_MAINTENANCE_PROMPT } from "../src/maintenance.ts";
+import { createTaskEvent, PERSISTENCE_CUSTOM_TYPE } from "../src/persistence.ts";
 import {
   configReader,
   FakeCtx,
@@ -21,6 +22,8 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
   createLoopExtension(pi.asExtensionApi(), {
     configPath: "/tmp/loop.json",
     timers,
+    // Isolate tests from an ambient PI_LOOP_DISABLE; switch tests opt in.
+    disabled: false,
     readFile: async () => {
       throw missingFile();
     },
@@ -433,19 +436,32 @@ test("busy ticks coalesce and flush once the agent settles", async () => {
   assert.equal(timers.pendingCount, 1);
 });
 
-test("a dispatch failure notifies and retries only at a safe point", async () => {
+test("a send failure is swallowed by Pi's fire-and-forget surface", async () => {
   const { timers, pi, ctx } = setup();
 
   await pi.run("loop", "every 1min risky", ctx);
+  const notificationsBefore = ctx.notifications.length;
+
   pi.sendError = new Error("send failed");
   timers.advance(60_000);
-  assert.equal(ctx.lastNotification()?.type, "error");
-  assert.match(ctx.lastNotification()?.message ?? "", /failed to send: send failed/);
-  assert.deepEqual(pi.sent, []);
+  assert.deepEqual(pi.sent, [], "a failed send delivers nothing");
+  assert.equal(pi.sendErrors.length, 1, "the fake records the internal failure the way Pi does");
+  assert.equal(
+    ctx.notifications.length,
+    notificationsBefore,
+    "the scheduler cannot observe a failure Pi catches internally",
+  );
 
+  // Like real Pi, the run is not retried: the boundary has advanced and the next
+  // one runs normally.
   pi.sendError = undefined;
-  pi.fire("agent_settled", ctx);
-  assert.deepEqual(pi.sent, ["risky"], "the retained run is delivered at the next idle point");
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["risky"]);
+});
+
+test("the fake sendUserMessage matches Pi's void fire-and-forget signature", () => {
+  const pi = new FakePi();
+  assert.equal(pi.sendUserMessage("hello"), undefined);
 });
 
 test("session shutdown stops the timer and clears pending work", async () => {
@@ -529,4 +545,132 @@ test("status reports a pending run and clears it after flush", async () => {
   pi.fire("agent_settled", ctx);
   await pi.run("loop", "status", ctx);
   assert.doesNotMatch(ctx.lastNotification()?.message ?? "", /queued/);
+});
+
+// ---------------------------------------------------------------------------
+// Persistent status / widget
+// ---------------------------------------------------------------------------
+
+test("the persistent status and widget show the count and next due", async () => {
+  const { pi, ctx } = setup();
+
+  await pi.run("loop", "every 5min check deploy", ctx);
+  assert.match(ctx.lastStatus() ?? "", /loop: 1 task/);
+  assert.match(ctx.lastStatus() ?? "", /next in 5min/);
+
+  const widget = ctx.lastWidget();
+  assert.ok(widget && widget.length === 1, "one widget line per task");
+  assert.match(widget[0]!, /\[fixed\]/);
+  assert.match(widget[0]!, /every 5min/);
+  assert.match(widget[0]!, /check deploy/);
+});
+
+test("the widget updates when a busy tick queues a run and clears after flush", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "every 1min poll", ctx);
+  ctx.idle = false;
+  timers.advance(60_000);
+  assert.match((ctx.lastWidget() ?? []).join("\n"), /pending/, "the tick repaints with the queued run");
+
+  ctx.idle = true;
+  pi.fire("agent_settled", ctx);
+  assert.doesNotMatch((ctx.lastWidget() ?? []).join("\n"), /pending/);
+});
+
+test("stopping the loop clears the persistent status and widget", async () => {
+  const { pi, ctx } = setup();
+
+  await pi.run("loop", "every 5min ping", ctx);
+  assert.notEqual(ctx.lastStatus(), undefined);
+
+  await pi.run("loop", "stop", ctx);
+  assert.equal(ctx.lastStatus(), undefined);
+  assert.equal(ctx.lastWidget(), undefined);
+});
+
+test("session shutdown clears the persistent status and widget", async () => {
+  const { pi, ctx } = setup();
+
+  await pi.run("loop", "every 5min ping", ctx);
+  pi.fire("session_shutdown", ctx);
+  assert.equal(ctx.lastStatus(), undefined);
+  assert.equal(ctx.lastWidget(), undefined);
+});
+
+test("a non-UI mode is never painted", async () => {
+  const { pi, ctx } = setup();
+
+  ctx.hasUI = false;
+  ctx.mode = "json";
+  await pi.run("loop", "every 5min ping", ctx);
+  assert.equal(ctx.statuses.length, 0);
+  assert.equal(ctx.widgets.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Disable switch
+// ---------------------------------------------------------------------------
+
+test("the disable switch registers no tools and starts no timers", async () => {
+  const { timers, pi, ctx, registry } = setup({ disabled: true });
+
+  assert.equal(pi.tools.size, 0, "no model scheduling tool is registered");
+
+  await pi.run("loop", "every 1min ping", ctx);
+  assert.equal(ctx.lastNotification()?.type, "warning");
+  assert.match(ctx.lastNotification()?.message ?? "", /disabled/);
+
+  await pi.run("loop", "status", ctx);
+  assert.match(ctx.lastNotification()?.message ?? "", /disabled/);
+
+  assert.equal(registry.size, 0);
+  assert.equal(timers.pendingCount, 0);
+  timers.advance(10 * 60_000);
+  assert.deepEqual(pi.sent, []);
+});
+
+test("the disable switch does not restore persisted tasks", () => {
+  const { timers, pi, registry } = setup({ disabled: true });
+  const ctx = new FakeCtx();
+  ctx.branch = [
+    {
+      type: "custom",
+      customType: PERSISTENCE_CUSTOM_TYPE,
+      data: createTaskEvent({
+        id: "t1",
+        prompt: "persisted",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: { intervalMs: 60_000, anchor: 0 },
+        nextFireAt: 60_000,
+      }),
+    },
+  ];
+
+  pi.fire("session_start", ctx);
+  assert.equal(registry.size, 0, "nothing is restored when disabled");
+  assert.equal(timers.pendingCount, 0, "no timer is armed when disabled");
+});
+
+test("enabling by default still registers tools and restores", () => {
+  const { pi, registry } = setup({ disabled: false });
+  assert.equal(pi.tools.size, 7, "the seven scheduling tools are registered");
+  const ctx = new FakeCtx();
+  ctx.branch = [
+    {
+      type: "custom",
+      customType: PERSISTENCE_CUSTOM_TYPE,
+      data: createTaskEvent({
+        id: "t1",
+        prompt: "persisted",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: { intervalMs: 60_000, anchor: 0 },
+        nextFireAt: 60_000,
+      }),
+    },
+  ];
+  pi.fire("session_start", ctx);
+  assert.equal(registry.has("t1"), true, "restoration keeps working when enabled");
 });

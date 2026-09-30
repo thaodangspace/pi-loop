@@ -454,6 +454,8 @@ test("the /loop command persists the seven-day default expiry for a fixed loop",
   createLoopExtension(pi.asExtensionApi(), {
     configPath: "/tmp/loop.json",
     timers,
+    // Isolate from an ambient PI_LOOP_DISABLE.
+    disabled: false,
     readFile: async () => {
       throw missingFile();
     },

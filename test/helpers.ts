@@ -96,10 +96,30 @@ export interface FakeNotification {
   type?: "info" | "warning" | "error";
 }
 
+/** One `setStatus` call recorded by the fake UI. */
+export interface FakeStatusUpdate {
+  key: string;
+  text: string | undefined;
+}
+
+/** One `setWidget` call recorded by the fake UI. */
+export interface FakeWidgetUpdate {
+  key: string;
+  lines: string[] | undefined;
+}
+
 /** Minimal command context used by the extension adapter. */
 export class FakeCtx {
   readonly notifications: FakeNotification[] = [];
   idle = true;
+  /** Run mode; "tui" by default so UI paths are exercised. */
+  mode: "tui" | "rpc" | "json" | "print" = "tui";
+  /** Whether dialog-capable UI is available (true in TUI and RPC modes). */
+  hasUI = true;
+  /** Every `setStatus` call, in order. */
+  readonly statuses: FakeStatusUpdate[] = [];
+  /** Every `setWidget` call, in order. */
+  readonly widgets: FakeWidgetUpdate[] = [];
   /** Active-branch entries returned by `sessionManager.getBranch()`. */
   branch: Array<{ type: string; customType?: string; data?: unknown; id?: string; parentId?: string | null }> = [];
   readonly sessionManager = {
@@ -109,6 +129,12 @@ export class FakeCtx {
     notify: (message: string, type?: "info" | "warning" | "error"): void => {
       this.notifications.push({ message, type });
     },
+    setStatus: (key: string, text: string | undefined): void => {
+      this.statuses.push({ key, text });
+    },
+    setWidget: (key: string, lines: string[] | undefined): void => {
+      this.widgets.push({ key, lines });
+    },
   };
 
   isIdle(): boolean {
@@ -117,6 +143,16 @@ export class FakeCtx {
 
   lastNotification(): FakeNotification | undefined {
     return this.notifications.at(-1);
+  }
+
+  /** The most recent status text, or undefined when none was set. */
+  lastStatus(): string | undefined {
+    return this.statuses.at(-1)?.text;
+  }
+
+  /** The most recent widget lines, or undefined when none was set. */
+  lastWidget(): string[] | undefined {
+    return this.widgets.at(-1)?.lines;
   }
 
   asCommandContext(): ExtensionCommandContext {
@@ -163,7 +199,16 @@ export class FakePi {
   readonly skills = new Map<string, string>();
   /** Custom entries appended via `appendEntry`, in order. */
   readonly appended: Array<{ customType: string; data: unknown }> = [];
+  /**
+   * Simulated internal send failure. Real Pi's `sendUserMessage` extension
+   * surface is fire-and-forget: it returns `void`, catches the async delivery
+   * rejection itself, and reports it through Pi's own error channel. The
+   * extension and scheduler therefore never observe it. Setting this records the
+   * error in {@link sendErrors} and delivers nothing, without throwing.
+   */
   sendError: Error | undefined;
+  /** Internal failures recorded by the fire-and-forget send surface. */
+  readonly sendErrors: unknown[] = [];
 
   /** Tools registered via `registerTool`, keyed by name. */
   readonly tools = new Map<string, ToolDefinition>();
@@ -199,7 +244,10 @@ export class FakePi {
 
   sendUserMessage(content: string | unknown, options?: { expandPromptTemplates?: boolean }): void {
     if (this.sendError) {
-      throw this.sendError;
+      // Pi catches the async rejection internally and emits its own error event;
+      // the `void` extension API swallows it, so nothing here may throw.
+      this.sendErrors.push(this.sendError);
+      return;
     }
     const text = typeof content === "string" ? content : JSON.stringify(content);
     const expand = options?.expandPromptTemplates ?? false;

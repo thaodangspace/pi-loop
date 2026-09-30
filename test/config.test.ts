@@ -5,7 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import {
   DEFAULT_INTERVAL_MS,
+  isLoopDisabled,
   loadDefaultInterval,
+  LOOP_DISABLE_ENV,
   LoopConfigError,
   loopConfigPath,
 } from "../src/config.ts";
@@ -93,6 +95,16 @@ test("config is read from the real filesystem path", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("the disable switch is opt-in and case-insensitive", () => {
+  for (const value of ["1", "true", "TRUE", "yes", " on ", "On"]) {
+    assert.equal(isLoopDisabled({ [LOOP_DISABLE_ENV]: value }), true, `expected "${value}" to disable`);
+  }
+  for (const value of ["0", "false", "no", "off", "", "   ", "enabled"]) {
+    assert.equal(isLoopDisabled({ [LOOP_DISABLE_ENV]: value }), false, `expected "${value}" to stay enabled`);
+  }
+  assert.equal(isLoopDisabled({}), false, "an unset switch leaves scheduling enabled");
 });
 
 test("loopConfigPath honours PI_LOOP_CONFIG and PI_CODING_AGENT_DIR", () => {
