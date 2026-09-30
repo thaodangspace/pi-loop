@@ -232,11 +232,21 @@ ignore the file.
 While any task is scheduled, the extension paints two persistent surfaces from
 the authoritative registry (never a separate copy):
 
-- a **footer status** with the active count, the soonest due/wakeup, and how
-  many runs are queued, for example `loop: 2 tasks · next in 5min · 1 pending`;
+- a **compact, single-line footer status** with the active loop count and the
+  earliest known next fire time as a local clock time, for example
+  `⟳ 1 loop · next 09:00`. With more than one task it also reports the per-mode
+  counts, for example `⟳ 3 loops · 2 fixed · 1 self-paced · next 09:00`;
 - a **widget** below the editor with one line per task, for example
   `t2 · [fixed] · every 10min · next in 8min: check deploy`, including the
   `pending` marker while a run waits for the next idle moment.
+
+The footer is always one line. A single task omits the per-mode breakdown; with
+more than one task it lists a count for each mode present (`fixed`,
+`self-paced`, `one-shot`). The `next` time is the earliest `nextFireAt` across
+the active tasks, rendered as local `HH:MM`; it is omitted when no task has a
+computed fire time, and tasks without one still count. A run queued while busy
+does not add a row (the `pending` marker stays in the widget and `/loop
+status`).
 
 Both surfaces are repainted after every state change: a create/delete/stop from
 `/loop` or a tool, a timer tick (including a busy tick that queues a run), a
@@ -504,7 +514,7 @@ The logic is split so it can be tested without Pi:
 | `src/cron.ts` | Pure 5-field cron: per-field parsing/validation (wildcard, value, step, range, list, names), the documented DOM/DOW OR rule, timezone-aware next-occurrence calculation with DST gap/overlap handling, and a bounded search. |
 | `src/task-registry.ts` | Per-session `ScheduledTask` registry: stable IDs, create/restore/get/update/delete, active-task limit, stored schedules, expiry, wakeup reasons, and deterministic disposal (injected clock and ID generator). |
 | `src/config.ts` | `loop.json` resolution with an injectable file reader, and the `PI_LOOP_DISABLE` switch (`isLoopDisabled`). |
-| `src/status.ts` | Pure formatting for the persistent status/widget and `/loop status`: countdowns, per-task lines (ID, mode, cadence, next due/wakeup, pending), and the compact footer summary. |
+| `src/status.ts` | Pure formatting for the persistent footer status/widget and `/loop status`: countdowns, per-task lines (ID, mode, cadence, next due/wakeup, pending), the local-clock-time helper, and the compact footer projection (total, per-mode counts, earliest next time). |
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
@@ -555,8 +565,10 @@ local-time resolution in an injected zone, DST spring-forward gaps and fall-back
 overlaps, an impossible-schedule bound, cron scheduler firing/coalescing/
 recompute-on-restore/expiry, far-future occurrences beyond the `setTimeout`
 cap, and a missed one-shot being dropped on restore. Visibility/disable coverage
-adds countdown and per-task-line formatting, the persistent status/widget
-populated on create and cleared on stop/shutdown, busy-tick and non-UI guards,
+adds countdown and per-task-line formatting, footer projection and local-clock
+rendering, the persistent footer/widget populated on create and cleared on
+stop/shutdown, mixed-mode counts, pending without an extra footer line, restore
+and branch-navigation refresh, busy-tick and non-UI guards,
 and the disable switch (pure env parsing plus an injected switch: no tools, no
 timers, no restore, `/loop` explaining the disabled state, and tools/restore
 still working when enabled).

@@ -126,7 +126,7 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
       return;
     }
     const now = timers.now();
-    ctx.ui.setStatus(STATUS_KEY, formatStatusLine(tasks, now));
+    ctx.ui.setStatus(STATUS_KEY, formatStatusLine(tasks));
     ctx.ui.setWidget(STATUS_KEY, formatTaskLines(tasks, now), { placement: "belowEditor" });
   };
 

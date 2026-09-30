@@ -3,6 +3,7 @@ import test from "node:test";
 import { createLoopExtension, type LoopExtensionDeps } from "../src/index.ts";
 import { BUILT_IN_MAINTENANCE_PROMPT } from "../src/maintenance.ts";
 import { createTaskEvent, PERSISTENCE_CUSTOM_TYPE } from "../src/persistence.ts";
+import { formatClockTime } from "../src/status.ts";
 import {
   configReader,
   FakeCtx,
@@ -39,6 +40,13 @@ function setup(overrides: Partial<LoopExtensionDeps> = {}) {
     registry,
   });
   return { timers, pi, ctx, registry };
+}
+
+/** Invoke a registered scheduler tool the way Pi would. */
+function callTool(pi: FakePi, name: string, params: unknown, ctx: FakeCtx): Promise<unknown> {
+  const tool = pi.tools.get(name);
+  assert.ok(tool, `tool ${name} must be registered`);
+  return tool.execute("call-1", params as never, undefined, undefined, ctx as never) as Promise<unknown>;
 }
 
 test("a self-paced loop reports its state and can be stopped", async () => {
@@ -551,18 +559,103 @@ test("status reports a pending run and clears it after flush", async () => {
 // Persistent status / widget
 // ---------------------------------------------------------------------------
 
-test("the persistent status and widget show the count and next due", async () => {
-  const { pi, ctx } = setup();
+test("the persistent footer and widget show the loop count and local next time", async () => {
+  const { pi, ctx, registry } = setup();
 
   await pi.run("loop", "every 5min check deploy", ctx);
-  assert.match(ctx.lastStatus() ?? "", /loop: 1 task/);
-  assert.match(ctx.lastStatus() ?? "", /next in 5min/);
+  const [task] = registry.list();
+  assert.ok(task?.nextFireAt !== undefined);
+  assert.match(ctx.lastStatus() ?? "", /^⟳ 1 loop · next \d{2}:\d{2}$/);
+  assert.equal(
+    ctx.lastStatus(),
+    `⟳ 1 loop · next ${formatClockTime(task.nextFireAt)}`,
+    "the footer shows the earliest next fire as local clock time",
+  );
 
   const widget = ctx.lastWidget();
   assert.ok(widget && widget.length === 1, "one widget line per task");
   assert.match(widget[0]!, /\[fixed\]/);
   assert.match(widget[0]!, /every 5min/);
   assert.match(widget[0]!, /check deploy/);
+});
+
+test("the footer aggregates mixed task modes and clears when the last task goes", async () => {
+  const { pi, ctx, registry } = setup();
+
+  // A self-paced command loop coexists with independent tool-created tasks.
+  await pi.run("loop", "watch deploy", ctx);
+  await callTool(pi, "schedule_task", { interval: "5min", prompt: "poll" }, ctx);
+  await callTool(pi, "schedule_once_task", { delay: "10min", prompt: "once" }, ctx);
+
+  assert.equal(
+    ctx.lastStatus(),
+    `⟳ 3 loops · 1 fixed · 1 self-paced · 1 one-shot · next ${formatClockTime(0)}`,
+    "the footer stays one line and counts every mode",
+  );
+
+  const [selfPaced] = registry.list().filter((item) => item.mode === "self-paced");
+  await callTool(pi, "delete_scheduled_task", { id: selfPaced!.id }, ctx);
+  assert.match(ctx.lastStatus() ?? "", /^⟳ 2 loops · 1 fixed · 1 one-shot · next \d{2}:\d{2}$/);
+
+  for (const item of registry.list()) {
+    await callTool(pi, "delete_scheduled_task", { id: item.id }, ctx);
+  }
+  assert.equal(ctx.lastStatus(), undefined, "no tasks leaves no footer");
+});
+
+test("the footer clears when a task expires", async () => {
+  const { timers, pi, ctx } = setup();
+
+  // Establish a session context the way Pi does before tools can run.
+  pi.fire("session_start", ctx);
+  await callTool(pi, "schedule_task", { interval: "1min", prompt: "shortlived", expiresIn: "1min" }, ctx);
+  assert.match(ctx.lastStatus() ?? "", /^⟳ 1 loop · next \d{2}:\d{2}$/);
+
+  timers.advance(60_000);
+  assert.equal(ctx.lastStatus(), undefined, "an expired task leaves no footer");
+});
+
+test("the footer includes a pending run without adding a line", async () => {
+  const { timers, pi, ctx } = setup();
+
+  await pi.run("loop", "every 1min poll", ctx);
+  ctx.idle = false;
+  timers.advance(60_000);
+  assert.match(ctx.lastStatus() ?? "", /^⟳ 1 loop · next \d{2}:\d{2}$/, "a queued run stays one line");
+  assert.doesNotMatch(ctx.lastStatus() ?? "", /\n/, "the footer is single-line");
+});
+
+test("restoring a branch repaints the footer and branch navigation clears it", () => {
+  const { pi } = setup();
+  const branch = [
+    {
+      type: "custom",
+      customType: PERSISTENCE_CUSTOM_TYPE,
+      data: createTaskEvent({
+        id: "t1",
+        prompt: "persisted",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: { intervalMs: 60_000, anchor: 0 },
+        nextFireAt: 60_000,
+      }),
+    },
+  ];
+
+  const restored = new FakeCtx();
+  restored.branch = branch;
+  pi.fire("session_start", restored);
+  assert.equal(
+    restored.lastStatus(),
+    `⟳ 1 loop · next ${formatClockTime(60_000)}`,
+    "a restored session reconstructs the footer from restored state",
+  );
+
+  // Navigating to a branch without the entry must drop the stale footer.
+  const nav = new FakeCtx();
+  nav.branch = [];
+  pi.fire("session_tree", nav);
+  assert.equal(nav.lastStatus(), undefined, "the footer reflects the entered branch immediately");
 });
 
 test("the widget updates when a busy tick queues a run and clears after flush", async () => {
