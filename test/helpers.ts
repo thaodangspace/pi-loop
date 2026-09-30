@@ -7,6 +7,7 @@ import type { ConfigReader } from "../src/config.ts";
 import type { SlashCommandLike } from "../src/dispatch.ts";
 import type { SchedulerDeps } from "../src/loop-core.ts";
 import type { JitterOffset } from "../src/schedule.ts";
+import type { EventBusLike } from "../src/service.ts";
 import { TaskRegistry } from "../src/task-registry.ts";
 
 interface FakeTimerTask {
@@ -162,6 +163,46 @@ export class FakeCtx {
 
 export type FakeHandler = (event: unknown, ctx: FakeCtx) => unknown;
 
+/**
+ * A synchronous in-process event bus matching Pi's `pi.events` contract
+ * (`emit`/`on`, with `on` returning an unsubscribe function). Synchronous
+ * delivery mirrors Pi's `EventEmitter`-backed bus, so a discovery request that a
+ * provider answers during `emit` resolves without waiting for the timeout.
+ */
+export class FakeEventBus implements EventBusLike {
+  private readonly handlers = new Map<string, Set<(data: unknown) => void>>();
+  /** Every channel emitted, in order, for assertions. */
+  readonly emitted: Array<{ channel: string; data: unknown }> = [];
+
+  emit(channel: string, data: unknown): void {
+    this.emitted.push({ channel, data });
+    for (const handler of [...(this.handlers.get(channel) ?? [])]) {
+      handler(data);
+    }
+  }
+
+  on(channel: string, handler: (data: unknown) => void): () => void {
+    const set = this.handlers.get(channel) ?? new Set();
+    set.add(handler);
+    this.handlers.set(channel, set);
+    return () => {
+      set.delete(handler);
+      if (set.size === 0) {
+        this.handlers.delete(channel);
+      }
+    };
+  }
+
+  listenerCount(channel: string): number {
+    return this.handlers.get(channel)?.size ?? 0;
+  }
+
+  /** Channels emitted at least once, in first-seen order. */
+  channels(): string[] {
+    return [...new Set(this.emitted.map((entry) => entry.channel))];
+  }
+}
+
 export interface FakeSendCall {
   /** The text Pi would deliver to the model, after any expansion. */
   text: string;
@@ -185,6 +226,8 @@ export interface FakeSendCall {
 export class FakePi {
   readonly commands = new Map<string, { handler: (args: string, ctx: FakeCtx) => Promise<void> }>();
   readonly handlers = new Map<string, FakeHandler[]>();
+  /** Shared extension event bus, matching `pi.events`. */
+  readonly events = new FakeEventBus();
   /** Delivered prompt texts (post-expansion), one per send. */
   readonly sent: string[] = [];
   /** Every send with the expansion flag the dispatcher chose. */

@@ -940,6 +940,50 @@ export class LoopScheduler implements WakeupService {
   }
 
   /**
+   * Reschedule one self-paced task by its explicit stable ID.
+   *
+   * This is the trusted, task-scoped counterpart to {@link scheduleNextWakeup}:
+   * where the model-facing path binds to the iteration that is currently
+   * executing, this targets the named task, so a sibling extension can pace a
+   * specific self-paced task without a running iteration. It is deliberately not
+   * exposed to the model. Only a self-paced task can be rescheduled.
+   *
+   * The requested delay is clamped into [1 minute, 1 hour]. An explicit choice
+   * clears the fallback allowance and any queued missed run, exactly like an
+   * iteration's own choice. Throws {@link WakeupError} for an unknown ID, a task
+   * that is not self-paced, or a disposed scheduler.
+   */
+  scheduleTaskWakeup(id: string, delayMs: number, reason?: string): WakeupDecision {
+    if (this.disposed) {
+      throw new WakeupError("scheduler has been disposed");
+    }
+    const entry = this.entries.get(id);
+    const task = this.registry.get(id);
+    if (!entry || !task || task.mode !== "self-paced") {
+      throw new WakeupError(`no self-paced task with id ${id}`);
+    }
+    const delay = clampWakeupDelay(delayMs);
+    const nextFireAtValue = this.deps.now() + delay;
+    const updated = this.registry.update(id, {
+      nextFireAt: nextFireAtValue,
+      pending: false,
+      reason: reason ?? null,
+    });
+    entry.awaitingDecision = false;
+    entry.fallbackUsed = false;
+    this.due.remove(entry.id);
+    this.clearTimer(entry);
+    this.armSelfPaced(entry, updated);
+    return {
+      requestedMs: delayMs,
+      delayMs: delay,
+      clamped: delay !== delayMs,
+      nextFireAt: nextFireAtValue,
+      ...(reason === undefined ? {} : { reason }),
+    };
+  }
+
+  /**
    * End the self-paced iteration that actually ran and apply the bounded fallback
    * policy when it neither rescheduled nor stopped. Safe to call at every idle
    * boundary for every mode; returns `{ action: "none" }` when nothing awaited.

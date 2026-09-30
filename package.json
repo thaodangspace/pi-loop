@@ -11,6 +11,11 @@
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./service": "./src/service.ts",
+    "./package.json": "./package.json"
+  },
   "pi": {
     "extensions": [
       "./src/index.ts"

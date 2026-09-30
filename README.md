@@ -55,6 +55,11 @@ conversation while the session stays open.
   first run is due immediately, and each iteration paces itself exactly like a
   prompt-only `/loop` — without replacing the command-owned loop or any other
   self-paced task. See [Model-callable tools](#model-callable-tools).
+- A versioned **extension-to-extension service** (`pi-loop/service`) lets a
+  trusted sibling extension such as `pi-workflow` schedule and control the same
+  session-scoped tasks without importing private modules or building a second
+  scheduler. See
+  [Extension integration](#extension-integration-public-scheduler-service).
 
 ### Self-paced loops
 
@@ -525,6 +530,109 @@ Validation and safety boundaries:
   expressed through the description prefix, `promptGuidelines`, and
   `executionMode: "sequential"` (the tools share mutable scheduler state).
 
+## Extension integration (public scheduler service)
+
+Sibling Pi extensions can use `pi-loop` as their scheduler instead of importing
+private modules or constructing a second scheduler. The supported surface is a
+small, versioned contract exported from the dedicated `pi-loop/service`
+entrypoint (also re-exported from the package root). It exposes the scheduler
+that owns the current session's registry, due queue, timers, persistence, and
+dispatch; `pi-loop` keeps ownership of all of that state.
+
+### Import
+
+```ts
+import { discoverLoopService } from "pi-loop/service";
+// or: import { discoverLoopService } from "pi-loop";
+```
+
+### Minimal consumer example
+
+A consumer discovers the service for the *current* session over Pi's documented
+extension event bus (`pi.events`), then schedules and manages tasks through the
+same registry and scheduler that `/loop` and the model-callable tools use:
+
+```ts
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { discoverLoopService } from "pi-loop/service";
+
+export default function myExtension(pi: ExtensionAPI) {
+  pi.on("session_start", async (_event, ctx) => {
+    const result = await discoverLoopService(pi.events);
+    if (!result.ok) {
+      // "timeout" when pi-loop is not loaded, "unavailable" when it is present
+      // but has no live service (disabled, or no session yet).
+      ctx.ui.notify(`pi-loop scheduler unavailable: ${result.message}`, "warning");
+      return;
+    }
+
+    const { service } = result;
+    const task = service.scheduleFixed(30 * 60_000, "run the workflow digest");
+    ctx.ui.notify(`workflow digest scheduled as ${task.id}`, "info");
+
+    // Later, from trusted extension code, by explicit task ID:
+    service.scheduleTaskWakeup(task.id, 60_000, "bring the next run forward");
+    service.deleteTask(task.id);
+  });
+}
+```
+
+### Contract
+
+| Member | Kind | Behavior |
+|---|---|---|
+| `version` | — | Always `1`; a future incompatible change ships as a new versioned entrypoint. |
+| `sessionId` | — | Opaque id of the session the handle is bound to. |
+| `isAvailable()` | read | `false` once the bound session has shut down or been reconstructed. |
+| `scheduleFixed(intervalMs, prompt, options?)` | mutating | Create a recurring interval task; `options.expiresAt` overrides the 7-day default. |
+| `scheduleCron(expression, prompt, options?)` | mutating | Create a 5-field cron task; `options.timeZone` and `options.expiresAt`. |
+| `scheduleOnce(at, prompt, options?)` | mutating | Run once at an absolute epoch time (`at` in ms) and then remove itself. |
+| `scheduleSelfPaced(prompt, options?)` | mutating | Create an independent self-paced task; `options.fallbackDelayMs` is clamped to 1 min–1 h. |
+| `listTasks()` | read | Frozen, serializable summaries of **every** active task, including the `/loop` command loop. |
+| `deleteTask(id)` | mutating | Remove a task and any queued run; returns `false` for an unknown ID. |
+| `scheduleTaskWakeup(id, delayMs, reason?)` | mutating | Reschedule one named self-paced task (clamped to 1 min–1 h). Trusted code only. |
+| `stopTask(id)` | mutating | Cancel one task and its queued run; returns `false` for an unknown ID. |
+
+Semantics and boundaries:
+
+- **One shared scheduler.** Every service call goes through the same
+  `LoopScheduler`/`TaskRegistry` as `/loop` and `schedule_task` etc. A task
+  created through the service appears in `list_scheduled_tasks` and `/loop
+  status`; deleting it through the service removes the same authoritative task
+  and cancels its timer.
+- **Summaries are snapshots.** `listTasks()` and every create method return
+  frozen objects of primitives, never mutable registry records.
+- **Predictable errors.** Invalid input throws the same typed errors as the
+  command/tool paths; `deleteTask`/`stopTask` return `false` for an unknown ID;
+  `scheduleTaskWakeup` throws `WakeupError` for an unknown or non-self-paced ID;
+  a call on a stale handle throws `LoopServiceUnavailableError`.
+- **Trusted, explicit operations.** `scheduleTaskWakeup(id, …)` is the
+  task-scoped counterpart to the model's iteration-scoped `schedule_wakeup`. It
+  is only on the service contract (not a model tool), so a sibling extension can
+  pace a specific task without a running iteration.
+
+### Discovery, load order, and lifetime
+
+- Discovery is a request/response exchange on versioned channels
+  (`pi-loop:service:discover:v1` → `pi-loop:service:reply:v1:<requestId>`), so a
+  consumer only ever receives the reply to its own request. There is no
+  process-global singleton and no private `src/*` import.
+- `discoverLoopService(events, { timeoutMs? })` resolves to
+  `{ ok: false, reason: "timeout" }` when `pi-loop` is not loaded, and to
+  `{ ok: false, reason: "unavailable" }` when it is loaded but has no live
+  service (disabled, or no session started yet). It never throws or crashes Pi.
+- **Load order.** A consumer that may load before `pi-loop` can retry or watch
+  `pi-loop:service:changed:v1` with `onLoopServiceChange(events, handler)`,
+  which reports when the service becomes available or goes away.
+- **Session lifetime.** A handle is bound to a session generation. Starting a
+  session, navigating the session tree (`session_tree`), or shutting the session
+  down invalidates outstanding handles: `isAvailable()` returns `false` and any
+  call throws `LoopServiceUnavailableError`. A rebuild first publishes an
+  `unavailable` status, reconstructs the registry, then publishes `available`
+  with the new `sessionId`, so a listener that reacts to availability always
+  observes the rebuilt state. A consumer cannot keep a silently-valid handle
+  that mutates the next session's state. Two Pi sessions never share a service.
+
 ## Costs and safety
 
 Every run sends a real prompt to the model, consuming tokens and possibly
@@ -561,6 +669,8 @@ The logic is split so it can be tested without Pi:
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
 | `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `schedule_self_paced_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
+| `src/service.ts` | Public, versioned extension-to-extension boundary (`pi-loop/service`): the `LoopServiceV1` contract, frozen `LoopTaskSummary` snapshots, the documented errors, and the `pi.events` discovery protocol (`discoverLoopService`, `onLoopServiceChange`). Pi-independent and unit testable. |
+| `src/service-provider.ts` | Internal provider for `src/service.ts`: the session-generation provider (`createLoopServiceProvider`), the `LoopServiceBackend` seam, and `summarizeTask`. Deliberately not a package entrypoint, so backend internals stay off the consumer surface. |
 | `src/index.ts` | Pi wiring: command, tool registration (skipped when disabled), persistent status/widget, idle events, per-run prompt resolution, and lifecycle cleanup. |
 
 `test/helpers.ts` provides a virtual clock (including a `sleep` jump that leaves

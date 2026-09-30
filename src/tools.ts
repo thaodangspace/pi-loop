@@ -30,7 +30,6 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { isCronSchedule } from "./cron.ts";
 import type { ScheduledPromptDecision } from "./dispatch.ts";
 import { ScheduledPromptRejectedError } from "./dispatch.ts";
 import {
@@ -43,10 +42,11 @@ import {
 } from "./loop-core.ts";
 import {
   TaskNotFoundError,
-  type ScheduledTask,
   type TaskMode,
   type TaskRegistry,
 } from "./task-registry.ts";
+import { summarizeTask } from "./service-provider.ts";
+import type { LoopTaskSummary } from "./service.ts";
 
 /** Stable tool names, exported so tests and docs share one source of truth. */
 export const SCHEDULER_TOOL_NAMES = {
@@ -61,28 +61,7 @@ export const SCHEDULER_TOOL_NAMES = {
 } as const;
 
 /** A serializable view of one task, returned in tool results. */
-export interface ScheduledTaskSummary {
-  /** Stable ID; the handle accepted by `delete_scheduled_task`. */
-  id: string;
-  mode: TaskMode;
-  prompt: string;
-  /** True for a maintenance loop whose prompt is re-resolved on every run. */
-  maintenance: boolean;
-  /** Normalized cadence for interval-scheduled fixed tasks. */
-  intervalMs?: number;
-  /** 5-field cron expression for calendar-scheduled fixed tasks. */
-  cron?: string;
-  /** IANA timezone a cron expression is interpreted in. */
-  timeZone?: string;
-  /** Absolute next fire time, when a schedule has been computed. */
-  nextFireAt?: number;
-  /** Absolute expiry, after which the task will not run again. */
-  expiresAt?: number;
-  /** True while a missed run is queued for the next idle moment. */
-  pending: boolean;
-  /** Self-paced only: the reason supplied with the latest wakeup. */
-  reason?: string;
-}
+export type ScheduledTaskSummary = LoopTaskSummary;
 
 export interface ScheduleTaskResult {
   ok: true;
@@ -141,26 +120,6 @@ export interface SchedulerToolDeps {
    * read-only `list_scheduled_tasks`.
    */
   onChange?: () => void;
-}
-
-/** Project a registry snapshot into the fields the tools expose. */
-export function summarizeTask(task: ScheduledTask): ScheduledTaskSummary {
-  const schedule = task.schedule;
-  return {
-    id: task.id,
-    mode: task.mode,
-    prompt: task.prompt,
-    maintenance: task.maintenance === true,
-    ...(schedule === undefined
-      ? {}
-      : isCronSchedule(schedule)
-        ? { cron: schedule.expression, timeZone: schedule.timeZone }
-        : { intervalMs: schedule.intervalMs }),
-    ...(task.nextFireAt === undefined ? {} : { nextFireAt: task.nextFireAt }),
-    ...(task.expiresAt === undefined ? {} : { expiresAt: task.expiresAt }),
-    pending: task.pending,
-    ...(task.reason === undefined ? {} : { reason: task.reason }),
-  };
 }
 
 /** A serializable view of one task created on a cron or one-shot schedule. */
