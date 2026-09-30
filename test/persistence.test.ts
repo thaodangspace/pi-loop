@@ -73,6 +73,83 @@ test("optional schedule and expiry metadata survive the codec", () => {
   }
 });
 
+test("a cron schedule round-trips and an unparsable one is rejected", () => {
+  const cron = { kind: "cron", expression: "0 9 * * 1-5", timeZone: "America/New_York" } as const;
+  const create = createTaskEvent({
+    id: "cron",
+    prompt: "weekday",
+    mode: "fixed",
+    createdAt: 0,
+    schedule: cron,
+    nextFireAt: 1_000,
+  });
+  const parsed = parseEvent(roundTrip(create));
+  assert.equal(parsed.ok, true);
+  if (parsed.ok && parsed.event.kind === "create") {
+    assert.deepEqual(parsed.event.task.schedule, cron);
+  }
+
+  const badExpression = parseEvent({
+    version: 1,
+    kind: "create",
+    task: {
+      id: "x",
+      prompt: "p",
+      mode: "fixed",
+      createdAt: 0,
+      schedule: { kind: "cron", expression: "99 * * * *", timeZone: "UTC" },
+    },
+  });
+  assert.equal(badExpression.ok, false, "an out-of-range cron field is rejected");
+  if (!badExpression.ok) {
+    assert.match(badExpression.reason, /invalid schedule/);
+  }
+
+  const badZone = parseEvent({
+    version: 1,
+    kind: "create",
+    task: {
+      id: "x",
+      prompt: "p",
+      mode: "fixed",
+      createdAt: 0,
+      schedule: { kind: "cron", expression: "* * * * *", timeZone: "Nope/Zone" },
+    },
+  });
+  assert.equal(badZone.ok, false, "an unknown timezone is rejected");
+});
+
+test("planRestore restores live cron tasks and drops expired ones", () => {
+  const now = 1_000_000;
+  const cron = { kind: "cron", expression: "*/5 * * * *", timeZone: "UTC" } as const;
+  const plan = replayEvents(
+    [
+      createTaskEvent({
+        id: "live",
+        prompt: "a",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: cron,
+        nextFireAt: 300_000,
+        expiresAt: now + 100_000,
+      }),
+      createTaskEvent({
+        id: "dead",
+        prompt: "b",
+        mode: "fixed",
+        createdAt: 0,
+        schedule: cron,
+        nextFireAt: 300_000,
+        expiresAt: now,
+      }),
+    ],
+    now,
+  );
+
+  assert.deepEqual(plan.tasks.map((task) => task.id), ["live"]);
+  assert.deepEqual(plan.tasks[0]!.schedule, cron);
+});
+
 test("malformed entries are rejected with a reportable reason", () => {
   const cases: unknown[] = [
     "not an object",

@@ -27,6 +27,7 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { isCronSchedule } from "./cron.ts";
 import type { ScheduledPromptDecision } from "./dispatch.ts";
 import { ScheduledPromptRejectedError } from "./dispatch.ts";
 import { formatInterval, parseInterval, type LoopScheduler } from "./loop-core.ts";
@@ -40,6 +41,8 @@ import {
 /** Stable tool names, exported so tests and docs share one source of truth. */
 export const SCHEDULER_TOOL_NAMES = {
   scheduleTask: "schedule_task",
+  scheduleCronTask: "schedule_cron_task",
+  scheduleOnceTask: "schedule_once_task",
   listTasks: "list_scheduled_tasks",
   deleteTask: "delete_scheduled_task",
   scheduleWakeup: "schedule_wakeup",
@@ -54,8 +57,12 @@ export interface ScheduledTaskSummary {
   prompt: string;
   /** True for a maintenance loop whose prompt is re-resolved on every run. */
   maintenance: boolean;
-  /** Normalized cadence for fixed tasks. */
+  /** Normalized cadence for interval-scheduled fixed tasks. */
   intervalMs?: number;
+  /** 5-field cron expression for calendar-scheduled fixed tasks. */
+  cron?: string;
+  /** IANA timezone a cron expression is interpreted in. */
+  timeZone?: string;
   /** Absolute next fire time, when a schedule has been computed. */
   nextFireAt?: number;
   /** Absolute expiry, after which the task will not run again. */
@@ -121,17 +128,28 @@ export interface SchedulerToolDeps {
 
 /** Project a registry snapshot into the fields the tools expose. */
 export function summarizeTask(task: ScheduledTask): ScheduledTaskSummary {
+  const schedule = task.schedule;
   return {
     id: task.id,
     mode: task.mode,
     prompt: task.prompt,
     maintenance: task.maintenance === true,
-    ...(task.schedule === undefined ? {} : { intervalMs: task.schedule.intervalMs }),
+    ...(schedule === undefined
+      ? {}
+      : isCronSchedule(schedule)
+        ? { cron: schedule.expression, timeZone: schedule.timeZone }
+        : { intervalMs: schedule.intervalMs }),
     ...(task.nextFireAt === undefined ? {} : { nextFireAt: task.nextFireAt }),
     ...(task.expiresAt === undefined ? {} : { expiresAt: task.expiresAt }),
     pending: task.pending,
     ...(task.reason === undefined ? {} : { reason: task.reason }),
   };
+}
+
+/** A serializable view of one task created on a cron or one-shot schedule. */
+export interface ScheduleOnceResult {
+  ok: true;
+  task: ScheduledTaskSummary;
 }
 
 function textResult<T>(text: string, details: T): AgentToolResult<T> {
@@ -143,6 +161,40 @@ function requirePrompt(prompt: unknown): string {
     throw new Error("prompt must be a non-empty string");
   }
   return prompt;
+}
+
+/** An ISO-8601 timestamp with an explicit UTC offset (`Z` or `±hh:mm`). */
+const ABSOLUTE_ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Resolve a one-shot time from exactly one of `delay` (a relative interval) or
+ * `at` (an absolute ISO-8601 timestamp). An absolute time must carry an explicit
+ * offset so its meaning never depends on the host's local zone, and must be in
+ * the future so the scheduled run is not silently dropped as already missed.
+ */
+function resolveOneShotTime(params: { delay?: string; at?: string }, now: number): number {
+  const hasDelay = params.delay !== undefined;
+  const hasAt = params.at !== undefined;
+  if (hasDelay === hasAt) {
+    throw new Error("give exactly one of delay or at");
+  }
+  if (params.delay !== undefined) {
+    return now + parseInterval(params.delay);
+  }
+  const text = (params.at ?? "").trim();
+  if (!ABSOLUTE_ISO.test(text)) {
+    throw new Error(
+      `at must be an ISO-8601 timestamp with an explicit offset or Z, got "${params.at}"`,
+    );
+  }
+  const parsed = Date.parse(text);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`at is not a valid timestamp: "${params.at}"`);
+  }
+  if (parsed <= now) {
+    throw new Error("at must be in the future");
+  }
+  return parsed;
 }
 
 /**
@@ -172,6 +224,48 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
       Type.String({
         description:
           "Optional lifetime as a number plus a unit (for example \"2d\"). The task is removed at creation time + this duration. Defaults to the scheduler's 7-day recurring-task lifetime; the value must outlast the first run.",
+      }),
+    ),
+  });
+
+  const ScheduleCronTaskParams = Type.Object({
+    cron: Type.String({
+      description:
+        "Standard 5-field cron expression in local time: minute hour day-of-month month day-of-week. Each field accepts *, a value, a range (a-b), a step (*/n or a-b/n), a comma list, and 3-letter month/day names (for example \"0 9 * * 1-5\"). If both day fields are restricted, a day matches when either does.",
+    }),
+    prompt: Type.String({
+      description:
+        "Prompt text delivered as a user message on every run. Plain text, a prompt template, or a known /skill: command.",
+    }),
+    timeZone: Type.Optional(
+      Type.String({
+        description:
+          "IANA timezone the expression is interpreted in (for example \"America/New_York\"). Defaults to the session's local zone.",
+      }),
+    ),
+    expiresIn: Type.Optional(
+      Type.String({
+        description:
+          "Optional lifetime as a number plus a unit (for example \"30d\"). The task is removed at creation time + this duration. Defaults to the scheduler's 7-day recurring-task lifetime, so pass a longer value for a weekly or rarer schedule.",
+      }),
+    ),
+  });
+
+  const ScheduleOnceTaskParams = Type.Object({
+    prompt: Type.String({
+      description:
+        "Prompt text delivered once as a user message. Plain text, a prompt template, or a known /skill: command.",
+    }),
+    delay: Type.Optional(
+      Type.String({
+        description:
+          "Run once after this delay, as a positive number plus a unit: s, min, h, or d (for example \"30min\"). Exactly one of delay or at must be given.",
+      }),
+    ),
+    at: Type.Optional(
+      Type.String({
+        description:
+          "Run once at this absolute ISO-8601 timestamp with an explicit offset or Z (for example \"2026-10-01T09:00:00-04:00\"). Exactly one of at or delay must be given, and the time must be in the future.",
       }),
     ),
   });
@@ -235,6 +329,67 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     },
   };
 
+  const scheduleCronTask: ToolDefinition<typeof ScheduleCronTaskParams, ScheduleTaskResult> = {
+    name: SCHEDULER_TOOL_NAMES.scheduleCronTask,
+    label: "Schedule Cron Task",
+    description:
+      "Mutating. Create a recurring task from a standard 5-field local-time cron expression (minute hour day-of-month month day-of-week). Independent of the /loop command loop; persisted across reloads. Returns the stable task ID. Throws a field-specific error for an invalid schedule.",
+    promptSnippet: "Create a recurring task from a 5-field local-time cron expression",
+    promptGuidelines: [
+      "schedule_cron_task interprets the expression in timeZone (default: the session's local zone). Use list_scheduled_tasks and delete_scheduled_task to inspect and cancel it.",
+    ],
+    parameters: ScheduleCronTaskParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<AgentToolResult<ScheduleTaskResult>> {
+      const prompt = requirePrompt(params.prompt);
+      classify(prompt);
+      const expiresAt =
+        params.expiresIn === undefined ? undefined : now() + parseInterval(params.expiresIn);
+      const task = scheduler.scheduleCron(params.cron, prompt, {
+        ...(params.timeZone === undefined ? {} : { timeZone: params.timeZone }),
+        ...(expiresAt === undefined ? {} : { expiresAt }),
+      });
+      // A cron occurrence beyond the expiry never runs; report that instead of
+      // returning an ID that is no longer live.
+      if (!registry.has(task.id)) {
+        throw new Error("task would expire before its first run; increase expiresIn");
+      }
+      const summary = summarizeTask(registry.get(task.id) ?? task);
+      const expiry =
+        summary.expiresAt === undefined
+          ? ""
+          : `, expiring in ${formatInterval(summary.expiresAt - now())}`;
+      return textResult(
+        `Scheduled task ${summary.id} on cron "${summary.cron}" (${summary.timeZone})${expiry}`,
+        { ok: true, task: summary } satisfies ScheduleTaskResult,
+      );
+    },
+  };
+
+  const scheduleOnceTask: ToolDefinition<typeof ScheduleOnceTaskParams, ScheduleOnceResult> = {
+    name: SCHEDULER_TOOL_NAMES.scheduleOnceTask,
+    label: "Schedule One-Shot Task",
+    description:
+      "Mutating. Create a task that fires once and then removes itself. Give exactly one of delay (relative) or at (an absolute ISO-8601 timestamp with an explicit offset). Persisted across reloads, but a run missed while unmounted is dropped, never replayed. Returns the stable task ID.",
+    promptSnippet: "Create a task that runs once and then removes itself",
+    promptGuidelines: [
+      "schedule_once_task runs alongside the /loop command loop; it does not replace it. A missed one-shot is discarded after resume rather than replayed.",
+    ],
+    parameters: ScheduleOnceTaskParams,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<AgentToolResult<ScheduleOnceResult>> {
+      const prompt = requirePrompt(params.prompt);
+      classify(prompt);
+      const at = resolveOneShotTime(params, now());
+      const task = scheduler.scheduleOnce(at, prompt);
+      const summary = summarizeTask(registry.get(task.id) ?? task);
+      return textResult(
+        `Scheduled one-shot task ${summary.id} at ${new Date(at).toISOString()}: ${summary.prompt}`,
+        { ok: true, task: summary } satisfies ScheduleOnceResult,
+      );
+    },
+  };
+
   const listTasks: ToolDefinition<typeof ListTasksParams, ListTasksResult> = {
     name: SCHEDULER_TOOL_NAMES.listTasks,
     label: "List Scheduled Tasks",
@@ -254,7 +409,11 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
           : tasks
               .map((task) => {
                 const cadence =
-                  task.intervalMs === undefined ? task.mode : `every ${formatInterval(task.intervalMs)}`;
+                  task.cron !== undefined
+                    ? `cron "${task.cron}" (${task.timeZone})`
+                    : task.intervalMs === undefined
+                      ? task.mode
+                      : `every ${formatInterval(task.intervalMs)}`;
                 const pending = task.pending ? ", pending" : "";
                 const expiry = task.expiresAt === undefined ? "" : `, expiresAt ${task.expiresAt}`;
                 return `${task.id} [${task.mode}] ${cadence}${pending}${expiry}: ${task.prompt}`;
@@ -359,7 +518,7 @@ export function createSchedulerTools(deps: SchedulerToolDeps): ToolDefinition<an
     },
   };
 
-  return [scheduleTask, listTasks, deleteTask, scheduleWakeup, stopWakeup];
+  return [scheduleTask, scheduleCronTask, scheduleOnceTask, listTasks, deleteTask, scheduleWakeup, stopWakeup];
 }
 
 /** Register every scheduler tool on a Pi instance. */

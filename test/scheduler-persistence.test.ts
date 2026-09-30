@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { LoopScheduler } from "../src/loop-core.ts";
 import type { PersistedEvent, PersistedTask } from "../src/persistence.ts";
+import type { FixedSchedule } from "../src/schedule.ts";
 import { FakeTimers, testRegistry } from "./helpers.ts";
 
 function setup(idle = true) {
@@ -116,7 +117,7 @@ test("restore keeps the stable ID, arms one timer, and writes no events", () => 
   assert.ok(task);
   assert.equal(task.id, "stable-1");
   assert.equal(registry.get("stable-1")?.id, "stable-1");
-  assert.equal(registry.get("stable-1")?.schedule?.intervalMs, 60_000);
+  assert.equal((registry.get("stable-1")?.schedule as FixedSchedule | undefined)?.intervalMs, 60_000);
   assert.equal(timers.pendingCount, 1, "the restored task is armed exactly once");
   assert.deepEqual(events, [], "replay must not duplicate persistence entries");
 });
