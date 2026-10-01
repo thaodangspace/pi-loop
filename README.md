@@ -375,6 +375,16 @@ changing it.
   wakeup; a second consecutive miss terminates the loop. `schedule_wakeup` and
   `stop_wakeup` apply only to the iteration that is currently executing; outside
   one they fail closed rather than targeting the command-owned loop.
+- **Self-paced and one-shot expiry is explicit and inclusive.** A self-paced task
+  has no default expiry, and a one-shot has none either; only a recurring fixed
+  task defaults to seven days. An explicit `expiresAt` is enforced everywhere:
+  an expiry before the first run is rejected at creation (never registered), a
+  run or wakeup exactly at the expiry still runs, a run strictly after it is
+  dropped (including from the due queue after a busy period), and a wakeup that
+  would land after it is rejected and terminates the task. A self-paced fallback
+  wakeup is never scheduled beyond the expiry; if it would be, the task terminates
+  instead. Passing an expiry therefore never yields a task that is already
+  impossible to run.
 - **Missed runs coalesce; no backlog.** If Pi is busy when a boundary or wakeup
   is due, the scheduler marks the task in its own due queue and delivers one run
   once Pi is idle again. Repeated misses for the same task coalesce, and distinct
@@ -602,8 +612,8 @@ export default function myExtension(pi: ExtensionAPI) {
 | `isAvailable()` | read | `false` once the bound session has shut down or been reconstructed. |
 | `scheduleFixed(intervalMs, prompt, options?)` | mutating | Create a recurring interval task; `options.expiresAt` overrides the 7-day default. |
 | `scheduleCron(expression, prompt, options?)` | mutating | Create a 5-field cron task; `options.timeZone` and `options.expiresAt`. |
-| `scheduleOnce(at, prompt, options?)` | mutating | Run once at an absolute epoch time (`at` in ms) and then remove itself. |
-| `scheduleSelfPaced(prompt, options?)` | mutating | Create an independent self-paced task; `options.fallbackDelayMs` is clamped to 1 min–1 h. |
+| `scheduleOnce(at, prompt, options?)` | mutating | Run once at an absolute epoch time (`at` in ms) and then remove itself; `options.expiresAt` is rejected if it precedes the first run. |
+| `scheduleSelfPaced(prompt, options?)` | mutating | Create an independent self-paced task; `options.fallbackDelayMs` is clamped to 1 min–1 h and `options.expiresAt` bounds its lifetime (no default). |
 | `listTasks()` | read | Frozen, serializable summaries of **every** active task, including the `/loop` command loop. |
 | `deleteTask(id)` | mutating | Remove a task and any queued run; returns `false` for an unknown ID. |
 | `scheduleTaskWakeup(id, delayMs, reason?)` | mutating | Reschedule one named self-paced task (clamped to 1 min–1 h). Trusted code only. |
