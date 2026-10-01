@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createLoopExtension } from "../src/index.ts";
-import { LoopScheduler } from "../src/loop-core.ts";
+import { ExpiryError, LoopScheduler } from "../src/loop-core.ts";
 import {
   createTaskEvent,
   replayEvents,
@@ -469,5 +469,139 @@ test("the /loop command persists the seven-day default expiry for a fixed loop",
   assert.equal(event.kind, "create");
   assert.equal(event.task.expiresAt, 5_000 + DEFAULT_TASK_TTL_MS, "the default bound reaches persistence");
   assert.equal(event.task.nextFireAt, MINUTE_MS, "the command loop stays on the boundary grid (jitter disabled here)");
+});
+
+// ---------------------------------------------------------------------------
+// Self-paced and one-shot expiry
+// ---------------------------------------------------------------------------
+
+test("a self-paced task records an explicit expiry and keeps no default", () => {
+  const { timers, registry, scheduler } = jitteredSetup();
+  timers.clock = 1_000;
+
+  const bounded = scheduler.scheduleSelfPaced("bounded", { expiresAt: 5_000 });
+  assert.equal(bounded.expiresAt, 5_000, "the explicit expiry is stored on the returned task");
+  assert.equal(registry.get(bounded.id)?.expiresAt, 5_000, "and on the registry record");
+
+  const unbounded = scheduler.scheduleSelfPaced("unbounded");
+  assert.equal(unbounded.expiresAt, undefined, "self-paced tasks have no default expiry");
+});
+
+test("a self-paced task whose expiry precedes its first run is rejected", () => {
+  const { timers, registry, scheduler } = jitteredSetup();
+  timers.clock = 1_000;
+
+  assert.throws(() => scheduler.scheduleSelfPaced("dead", { expiresAt: 999 }), ExpiryError);
+  assert.equal(registry.size, 0, "a dead-on-arrival self-paced task is never registered");
+  assert.equal(timers.pendingCount, 0, "and arms no timer");
+
+  // The expiry is inclusive: a first run exactly at it is still allowed.
+  const boundary = scheduler.scheduleSelfPaced("at boundary", { expiresAt: 1_000 });
+  assert.equal(registry.has(boundary.id), true);
+});
+
+test("a self-paced task never dispatches after its expiry, including after a busy period", () => {
+  const { timers, registry, scheduler, dispatched, setIdle } = jitteredSetup(true);
+  timers.clock = 0;
+  const task = scheduler.scheduleSelfPaced("pace", { expiresAt: 90_000 });
+
+  timers.advance(0);
+  assert.deepEqual(dispatched, ["pace"], "the first run is due immediately");
+
+  // Choose a wakeup inside the expiry, then let it come due while Pi is busy.
+  scheduler.scheduleTaskWakeup(task.id, MINUTE_MS);
+  setIdle(false);
+  timers.advance(MINUTE_MS);
+  assert.deepEqual(dispatched, ["pace"]);
+  assert.deepEqual(scheduler.dueTaskIds(), [task.id], "the run is queued while busy");
+
+  // The clock jumps past the expiry before the queued run is flushed.
+  timers.sleep(120_000);
+  setIdle(true);
+  assert.equal(scheduler.flush(), false);
+  assert.deepEqual(dispatched, ["pace"], "an expired queued run is never delivered");
+  assert.equal(registry.has(task.id), false, "the expired task is removed");
+  assert.deepEqual(scheduler.dueTaskIds(), []);
+  assert.equal(timers.pendingCount, 0, "its timer is cleared");
+});
+
+test("a task-scoped self-paced wakeup beyond expiry is rejected and terminates the task", () => {
+  const { timers, registry, scheduler } = jitteredSetup();
+  timers.clock = 0;
+  const task = scheduler.scheduleSelfPaced("pace", { expiresAt: 30_000 });
+
+  assert.throws(() => scheduler.scheduleTaskWakeup(task.id, MINUTE_MS), ExpiryError);
+  assert.equal(registry.has(task.id), false, "the task is terminated rather than kept past expiry");
+  assert.equal(timers.pendingCount, 0, "its timer is cleared");
+});
+
+test("a self-paced iteration cannot reschedule past its expiry", () => {
+  const { timers, registry, scheduler, dispatched } = jitteredSetup(true);
+  timers.clock = 0;
+  const task = scheduler.scheduleSelfPaced("pace", { expiresAt: 90_000 });
+
+  timers.advance(0);
+  assert.deepEqual(dispatched, ["pace"], "the first run binds the executing iteration");
+
+  // HOUR_MS clamps to the maximum wakeup delay and lands past the 90s expiry.
+  assert.throws(() => scheduler.scheduleNextWakeup(HOUR_MS), ExpiryError);
+  assert.equal(registry.has(task.id), false, "the executing task is terminated");
+});
+
+test("a self-paced fallback never schedules beyond expiry", () => {
+  const { timers, registry, scheduler, dispatched } = jitteredSetup(true);
+  timers.clock = 0;
+
+  const doomed = scheduler.scheduleSelfPaced("doomed", { expiresAt: 90_000, fallbackDelayMs: HOUR_MS });
+  timers.advance(0);
+  assert.deepEqual(dispatched, ["doomed"]);
+  // No wakeup chosen: the fallback (1h) would land past the 90s expiry.
+  assert.deepEqual(scheduler.settleIteration(), { action: "terminated" });
+  assert.equal(registry.has(doomed.id), false);
+
+  // A fallback that fits inside the expiry is still granted normally.
+  const kept = scheduler.scheduleSelfPaced("kept", {
+    expiresAt: 10 * MINUTE_MS,
+    fallbackDelayMs: MINUTE_MS,
+  });
+  timers.advance(0);
+  assert.deepEqual(scheduler.settleIteration(), {
+    action: "fallback",
+    delayMs: MINUTE_MS,
+    nextFireAt: timers.clock + MINUTE_MS,
+  });
+  assert.equal(registry.has(kept.id), true);
+});
+
+test("self-paced and one-shot expiry boundaries are inclusive", () => {
+  const { timers, registry, scheduler, dispatched } = jitteredSetup(true);
+  timers.clock = 0;
+
+  const paced = scheduler.scheduleSelfPaced("pace", { expiresAt: MINUTE_MS });
+  const decision = scheduler.scheduleTaskWakeup(paced.id, MINUTE_MS);
+  assert.equal(decision.nextFireAt, MINUTE_MS, "a wakeup exactly at the expiry is allowed");
+
+  const later = scheduler.scheduleSelfPaced("later", { expiresAt: MINUTE_MS });
+  assert.throws(() => scheduler.scheduleTaskWakeup(later.id, MINUTE_MS + 1), ExpiryError);
+
+  const once = scheduler.scheduleOnce(10_000, "once", { expiresAt: 10_000 });
+  assert.equal(once.expiresAt, 10_000);
+
+  timers.advance(MINUTE_MS);
+  assert.deepEqual(
+    dispatched,
+    ["once", "pace"],
+    "a one-shot and a self-paced wakeup exactly at their expiry still run",
+  );
+  assert.equal(registry.has(once.id), false);
+});
+
+test("scheduleOnce rejects an expiry earlier than its first run", () => {
+  const { timers, registry, scheduler } = jitteredSetup();
+  timers.clock = 0;
+
+  assert.throws(() => scheduler.scheduleOnce(10_000, "once", { expiresAt: 9_999 }), ExpiryError);
+  assert.equal(registry.size, 0, "an impossible one-shot is never registered");
+  assert.equal(timers.pendingCount, 0, "and arms no timer");
 });
 

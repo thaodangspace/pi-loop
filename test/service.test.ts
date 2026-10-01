@@ -16,13 +16,14 @@ import {
   isLoopServiceV1,
   LOOP_SERVICE_CHANGED_CHANNEL,
   LOOP_SERVICE_VERSION,
+  LoopServiceInputError,
   LoopServiceUnavailableError,
   onLoopServiceChange,
   type LoopServiceV1,
   type LoopTaskSummary,
 } from "../src/service.ts";
 import { createLoopServiceProvider, type LoopServiceBackend } from "../src/service-provider.ts";
-import { WakeupError } from "../src/loop-core.ts";
+import { ExpiryError, WakeupError } from "../src/loop-core.ts";
 import { PERSISTENCE_CUSTOM_TYPE } from "../src/persistence.ts";
 import { FakeCtx, FakeEventBus, FakePi, FakeTimers, missingFile, testRegistry } from "./helpers.ts";
 
@@ -295,6 +296,79 @@ test("service rejects undeliverable and dead-on-arrival tasks", async () => {
   assert.throws(() => service.scheduleFixed(60_000, "/loop stop"), /extension command/);
   // An interval longer than the expiry can never reach a first boundary.
   assert.throws(() => service.scheduleFixed(86_400_000, "never runs", { expiresAt: 1_000 }), /expire/);
+});
+
+test("the service reports and enforces an explicit self-paced expiry", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  const service = expectService(await discover(pi, ctx));
+  timers.clock = 1_000;
+
+  const summary = service.scheduleSelfPaced("paced", { expiresAt: 5_000 });
+  assert.equal(summary.mode, "self-paced");
+  assert.equal(summary.expiresAt, 5_000, "the returned summary carries the requested expiry");
+  assert.equal(registry.get(summary.id)?.expiresAt, 5_000, "the registry record carries it too");
+  assert.equal(
+    service.listTasks().find((task) => task.id === summary.id)?.expiresAt,
+    5_000,
+    "listTasks reports the expiry",
+  );
+
+  // An expiry before the first run is impossible to honour: the service must not
+  // report success.
+  assert.throws(
+    () => service.scheduleSelfPaced("dead", { expiresAt: 500 }),
+    (error: unknown) => error instanceof LoopServiceInputError && /expire/.test(error.message),
+  );
+  assert.equal(registry.size, 1, "the rejected task is not registered");
+});
+
+test("the service rejects a one-shot that cannot reach its first run", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  const service = expectService(await discover(pi, ctx));
+  timers.clock = 0;
+
+  assert.throws(
+    () => service.scheduleOnce(10_000, "once", { expiresAt: 9_999 }),
+    (error: unknown) => error instanceof LoopServiceInputError && /expire/.test(error.message),
+  );
+  assert.equal(registry.size, 0, "no impossible one-shot is registered");
+
+  // An expiry exactly at the first run is inclusive and accepted.
+  const ok = service.scheduleOnce(10_000, "once", { expiresAt: 10_000 });
+  assert.equal(ok.expiresAt, 10_000);
+  assert.equal(registry.has(ok.id), true);
+});
+
+test("an explicit wakeup past a self-paced task's expiry is rejected and terminates it", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  const service = expectService(await discover(pi, ctx));
+  timers.clock = 0;
+
+  const paced = service.scheduleSelfPaced("paced", { expiresAt: 30_000 });
+  assert.throws(() => service.scheduleTaskWakeup(paced.id, 60_000), ExpiryError);
+  assert.equal(registry.has(paced.id), false, "the impossible wakeup terminates the task");
+});
+
+test("a service self-paced task never dispatches after its expiry, even busy", async () => {
+  const { timers, pi, ctx, registry } = setup();
+  const service = expectService(await discover(pi, ctx));
+  timers.clock = 0;
+
+  const paced = service.scheduleSelfPaced("pace", { expiresAt: 90_000 });
+  timers.advance(0);
+  assert.deepEqual(pi.sent, ["pace"], "the first run is due immediately");
+  service.scheduleTaskWakeup(paced.id, 60_000); // inside the expiry
+
+  // The wakeup comes due while Pi is busy, then the clock jumps past expiry.
+  ctx.idle = false;
+  timers.advance(60_000);
+  assert.deepEqual(pi.sent, ["pace"], "the busy run is queued, not yet delivered");
+  timers.sleep(120_000);
+  ctx.idle = true;
+  pi.fire("agent_settled", ctx);
+
+  assert.deepEqual(pi.sent, ["pace"], "the expired queued run is dropped");
+  assert.equal(registry.has(paced.id), false, "the expired task is removed");
 });
 
 // ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ import {
 } from "./dispatch.ts";
 import {
   clampWakeupDelay,
+  ExpiryError,
   formatInterval,
   LoopScheduler,
   parseLoopCommand,
@@ -245,40 +246,64 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     return summarizeTask(live);
   };
 
+  /**
+   * Create a task through the shared scheduler and return its summary. The
+   * scheduler rejects a self-paced or one-shot task whose expiry precedes its
+   * first run with {@link ExpiryError}; the service translates that into its
+   * documented input error so the public contract never reports success (or a
+   * dead ID) for a task that is already impossible to run.
+   */
+  const createTask = (what: string, create: () => ScheduledTask): LoopTaskSummary => {
+    let task: ScheduledTask;
+    try {
+      task = create();
+    } catch (error) {
+      if (error instanceof ExpiryError) {
+        throw new LoopServiceInputError(error.message);
+      }
+      throw error;
+    }
+    return createdSummary(task, what);
+  };
+
   const serviceBackend: LoopServiceBackend = {
     scheduleFixed(intervalMs, prompt, options) {
       assertDeliverable(prompt);
-      const task = scheduler.scheduleFixed(
-        intervalMs,
-        prompt,
-        options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+      return createTask("fixed", () =>
+        scheduler.scheduleFixed(
+          intervalMs,
+          prompt,
+          options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+        ),
       );
-      return createdSummary(task, "fixed");
     },
     scheduleCron(expression, prompt, options) {
       assertDeliverable(prompt);
-      const task = scheduler.scheduleCron(expression, prompt, {
-        ...(options?.timeZone === undefined ? {} : { timeZone: options.timeZone }),
-        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
-      });
-      return createdSummary(task, "cron");
+      return createTask("cron", () =>
+        scheduler.scheduleCron(expression, prompt, {
+          ...(options?.timeZone === undefined ? {} : { timeZone: options.timeZone }),
+          ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+        }),
+      );
     },
     scheduleOnce(at, prompt, options) {
       assertDeliverable(prompt);
-      const task = scheduler.scheduleOnce(
-        at,
-        prompt,
-        options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+      return createTask("one-shot", () =>
+        scheduler.scheduleOnce(
+          at,
+          prompt,
+          options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+        ),
       );
-      return createdSummary(task, "one-shot");
     },
     scheduleSelfPaced(prompt, options) {
       assertDeliverable(prompt);
-      const task = scheduler.scheduleSelfPaced(prompt, {
-        ...(options?.fallbackDelayMs === undefined ? {} : { fallbackDelayMs: options.fallbackDelayMs }),
-        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
-      });
-      return summarizeTask(registry.get(task.id) ?? task);
+      return createTask("self-paced", () =>
+        scheduler.scheduleSelfPaced(prompt, {
+          ...(options?.fallbackDelayMs === undefined ? {} : { fallbackDelayMs: options.fallbackDelayMs }),
+          ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+        }),
+      );
     },
     listTasks: () => registry.list().map(summarizeTask),
     deleteTask: (id) => {
