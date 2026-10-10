@@ -18,6 +18,11 @@ import {
   ScheduledPromptRejectedError,
 } from "./dispatch.ts";
 import {
+  createIterationGuidanceTracker,
+  SELF_PACED_ITERATION_SECTION,
+  selfPacedIterationGuidance,
+} from "./iteration-guidance.ts";
+import {
   clampWakeupDelay,
   formatInterval,
   LoopScheduler,
@@ -176,14 +181,25 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     return raw;
   };
 
+  // Iteration-scoped guidance for self-paced turns. Armed when a self-paced run
+  // is dispatched and consumed by `before_agent_start`, so a running model that
+  // never opened the loop-scheduler skill still learns the wakeup/stop contract
+  // for exactly the iteration it is executing. Advisory only: it never changes
+  // scheduler state or the scheduled prompt.
+  const guidance = createIterationGuidanceTracker();
+
   const scheduler = new LoopScheduler(
     timers,
     registry,
-    (_task, prompt) => {
+    (task, prompt) => {
       // A user message, never a shell command. The dispatcher decides whether Pi
       // should expand a skill/template or send the text literally, and refuses
-      // to send a rejected control form.
-      dispatcher.dispatch(prompt);
+      // to send a rejected control form. Arm guidance only after delivery is
+      // decided, so a rejected prompt leaves no stale marker for a later turn.
+      const decision = dispatcher.dispatch(prompt);
+      if (task.mode === "self-paced") {
+        guidance.arm(task.id, prompt, decision.action === "literal");
+      }
     },
     () => latestCtx?.isIdle() ?? true,
     (error) => {
@@ -550,6 +566,8 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
 
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    // A new session/generation owns no dispatched iteration from a prior one.
+    guidance.clear();
     // Invalidate the previous generation *before* rebuilding, and publish the
     // new one only once reconstruction is complete. A synchronous change listener
     // can therefore never discover a service that points at the pre-rebuild
@@ -570,6 +588,9 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   // captured before navigation cannot silently mutate the rebuilt state.
   pi.on("session_tree", (_event, ctx) => {
     latestCtx = ctx;
+    // Navigating branches retires the session generation; drop any armed
+    // guidance so it cannot attach to a turn on the entered branch.
+    guidance.clear();
     if (!disabled) {
       serviceProvider.endSession();
     }
@@ -579,9 +600,33 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
     }
   });
 
+  // Deliver bounded, iteration-scoped guidance for a self-paced turn only. The
+  // marker is armed by the dispatch that produced this turn and is consumed (or
+  // dropped) here, so it can never attach to an ordinary user turn, a fixed/
+  // cron/one-shot run, another task's iteration, or a turn whose task was
+  // deleted mid-flight. Mutating `sections` leaves the scheduled user prompt
+  // untouched, and Pi diffs sections so the guidance disappears on the next
+  // non-iteration turn. Advisory only: no scheduler state changes here.
+  pi.on("before_agent_start", (event) => {
+    const executing = scheduler.executingSelfPacedTask();
+    // Consume unconditionally: a non-matching turn must drop the marker, not
+    // leave it armed for a later one.
+    const matches = guidance.consume(executing?.id, event.prompt);
+    if (!matches || executing === undefined) {
+      return;
+    }
+    event.systemPromptOptions.sections = {
+      ...event.systemPromptOptions.sections,
+      [SELF_PACED_ITERATION_SECTION]: selfPacedIterationGuidance(executing.id),
+    };
+  });
+
   // Refresh the context and idle snapshot whenever an agent run boundary moves.
   pi.on("agent_start", (_event, ctx) => {
     latestCtx = ctx;
+    // `before_agent_start` has already consumed the marker; clearing here is a
+    // defensive boundary for a host that does not emit the hook.
+    guidance.clear();
     refreshUi(ctx);
   });
 
@@ -592,6 +637,9 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   // the next idle boundary.
   pi.on("agent_settled", (_event, ctx) => {
     latestCtx = ctx;
+    // The turn is over: drop any marker that never became a turn (a rejected or
+    // internally failed delivery) before flushing may arm a fresh one below.
+    guidance.clear();
     const settled = scheduler.settleIteration();
     if (settled.action === "fallback") {
       ctx.ui.notify(
@@ -609,6 +657,8 @@ export function createLoopExtension(pi: ExtensionAPI, deps: LoopExtensionDeps = 
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    // Drop iteration guidance before the context is released.
+    guidance.clear();
     // Stop every tracked task (not just the command-owned loop) so no timer or
     // stale callback survives, then drop the records.
     scheduler.stopAll();

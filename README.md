@@ -120,6 +120,43 @@ The task is submitted as a normal **user message**, so the agent chooses its own
 tools and replies in the conversation. The text is never executed as a shell
 command, and Pi's usual tool permissions apply.
 
+### Iteration-scoped runtime guidance
+
+A self-paced iteration is expected to call `schedule_wakeup` or `stop_wakeup`
+itself, but a model may never open the `loop-scheduler` skill or read a tool
+description before acting. For exactly the turn a self-paced run produces, the
+extension therefore adds a short reminder through Pi's `before_agent_start`
+system-context hook, as a dedicated system-prompt section. It states that this is
+a self-paced iteration, that the model should complete one bounded unit of work
+and then call `schedule_wakeup` with a delay and reason or `stop_wakeup`, that
+the tools act only on the executing iteration (no task ID), and that the fallback
+is a safety net rather than the normal continuation path.
+
+This is guidance, not behavior: the scheduler still grants no implicit wakeup,
+stops nothing, and leaves the fallback, expiry, timer, and persistence rules
+unchanged. The scheduled prompt itself is never rewritten, and the dispatcher's
+classification/expansion guarantees are untouched. The section is bound to the
+**dispatched task's stable ID** and the scheduler's live executing-iteration
+binding, so it is never injected for `primaryId`, a fixed/cron/one-shot run, an
+ordinary user turn, another task's iteration, or a turn whose task was deleted
+mid-flight. Pi diffs system-prompt sections, so the guidance is removed on the
+next turn that is not that iteration; the marker is also dropped at
+`agent_settled`, `session_start`, `session_tree`, and `session_shutdown`, and a
+rejected or failed delivery never leaves it armed.
+
+Three layers work together:
+
+- `schedule_wakeup` / `stop_wakeup` **tool descriptions and `promptGuidelines`**
+  explain the operations when the model is already choosing a tool.
+- The **`loop-scheduler` skill** (below) is the in-depth, on-demand usage guide
+  with the full decision tree and lifecycle.
+- **Per-iteration runtime guidance** is the short, always-present reminder for the
+  self-paced turn that is running right now.
+
+If a host does not provide `before_agent_start`, no guidance is delivered and
+scheduling behaves exactly as before; the hook is present in the declared
+minimum Pi (`0.87.1`) and the current line.
+
 ### Due queue and flush order
 
 While Pi is busy, a due run is neither delivered nor lost. The scheduler records
@@ -216,9 +253,11 @@ pending, without starting unrelated work or taking irreversible actions.
 The extension uses only the documented Pi extension API (`registerCommand`,
 `getCommands`, `sendUserMessage`, `appendEntry`, `ctx.isIdle()`,
 `ctx.sessionManager.getBranch()`, `ctx.hasUI`, `ctx.ui.setStatus` /
-`ctx.ui.setWidget`, and the `session_start` / `session_tree` / `agent_start` /
-`agent_settled` / `session_shutdown` events). It does not spawn processes or
-timers at load; a timer exists only while a loop is active.
+`ctx.ui.setWidget`, and the `session_start` / `session_tree` / `before_agent_start`
+/ `agent_start` / `agent_settled` / `session_shutdown` events, with
+`before_agent_start` used only to add the self-paced iteration guidance section).
+It does not spawn processes or timers at load; a timer exists only while a loop
+is active.
 
 ## Install
 
@@ -704,6 +743,7 @@ The logic is split so it can be tested without Pi:
 | `src/maintenance.ts` | Maintenance-prompt resolution: `.claude/loop.md` → `~/.claude/loop.md` → built-in, with an injectable reader, byte-bounded truncation, and hard errors for unreadable files. |
 | `src/persistence.ts` | Versioned, validated schema for fixed-task create/update/delete session entries, plus pure branch-order replay that drops expired tasks, missed one-shots, and self-paced tasks and fails a branch closed on any unreadable entry. |
 | `src/dispatch.ts` | Scheduled-prompt dispatch: classify a prompt against `getCommands()` as literal, expandable (skill/template), or rejected (extension/interactive/unknown-skill); send literal text exactly and expand only skills/templates. |
+| `src/iteration-guidance.ts` | Iteration-scoped runtime guidance for self-paced turns: the advisory system-prompt section text and a task-ID-bound, consume-once tracker that is armed by a self-paced dispatch and matched against the scheduler's live executing-iteration binding. |
 | `src/tools.ts` | Model-callable scheduler tools (`schedule_task`, `schedule_cron_task`, `schedule_once_task`, `schedule_self_paced_task`, `list_scheduled_tasks`, `delete_scheduled_task`, `schedule_wakeup`, `stop_wakeup`) as typed TypeBox schemas over the shared scheduler and registry, with read-only vs mutating intent and typed error boundaries. |
 | `src/service.ts` | Public, versioned extension-to-extension boundary (`pi-loop/service`): the `LoopServiceV1` contract, frozen `LoopTaskSummary` snapshots, the documented errors, and the `pi.events` discovery protocol (`discoverLoopService`, `onLoopServiceChange`). Pi-independent and unit testable. |
 | `src/service-provider.ts` | Internal provider for `src/service.ts`: the session-generation provider (`createLoopServiceProvider`), the `LoopServiceBackend` seam, and `summarizeTask`. Deliberately not a package entrypoint, so backend internals stay off the consumer surface. |
@@ -769,7 +809,14 @@ stop/shutdown, mixed-mode counts, pending without an extra footer line, restore
 and branch-navigation refresh, busy-tick and non-UI guards,
 and the disable switch (pure env parsing plus an injected switch: no tools, no
 timers, no restore, `/loop` explaining the disabled state, and tools/restore
-still working when enabled).
+still working when enabled). Iteration-guidance coverage adds the trait of the
+text, task-ID binding and consume-once behavior, literal-prompt matching, the
+section name/rendering cross-checked against the installed Pi system-prompt
+builder, guidance on a self-paced primary loop and independent tasks (each turn
+carrying its own task ID), queued multi-task delivery at separate idle
+boundaries, absence of guidance for fixed/cron/one-shot and ordinary turns,
+and no stale guidance after a rejected maintenance dispatch, a mid-flight
+delete, or the `agent_settled`/`session_tree`/`session_shutdown` boundaries.
 
 ### Live smoke test
 

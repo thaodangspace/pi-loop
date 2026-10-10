@@ -211,6 +211,12 @@ schedule_cron_task(cron: "0 9 * * 1", prompt: "Post the weekly metrics summary."
   skill does **not** guarantee it is read on every turn or every iteration: in a
   self-paced task, put the required continuation behavior (call `schedule_wakeup`
   or `stop_wakeup`) explicitly in the scheduled prompt.
+- When a self-paced iteration actually runs, pi-loop also adds a short
+  **per-iteration runtime reminder** (a system-prompt section for that turn) that
+  names the executing task and asks for `schedule_wakeup` or `stop_wakeup`. That
+  reminder is advisory and iteration-scoped; it never changes scheduler state and
+  is not a substitute for calling the tools. Tool descriptions cover the
+  operations themselves.
 - This skill documents usage only. It does not change scheduler state, add tools,
   or make anything run automatically.
 
