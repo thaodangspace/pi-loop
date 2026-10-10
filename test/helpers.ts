@@ -252,12 +252,6 @@ export class FakePi {
   sendError: Error | undefined;
   /** Internal failures recorded by the fire-and-forget send surface. */
   readonly sendErrors: unknown[] = [];
-  /**
-   * Optional hook run after a successful send, to model the fact that Pi starts
-   * a turn synchronously and is no longer idle. Tests use it to drive the
-   * scheduler's idle/due-queue behavior realistically across several tasks.
-   */
-  onSend: (() => void) | undefined;
 
   /** Tools registered via `registerTool`, keyed by name. */
   readonly tools = new Map<string, ToolDefinition>();
@@ -331,7 +325,6 @@ export class FakePi {
     }
     this.calls.push({ text: delivered, expandPromptTemplates: expand });
     this.sent.push(delivered);
-    this.onSend?.();
   }
 
   /** Append a custom entry the way Pi persists extension state. */
