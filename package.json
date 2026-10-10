@@ -19,6 +19,9 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
+    ],
+    "skills": [
+      "./skills/loop-scheduler"
     ]
   },
   "scripts": {

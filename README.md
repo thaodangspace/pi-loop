@@ -233,12 +233,27 @@ Pi loads TypeScript directly (via `jiti`), so no build step is needed.
 ### As a discovered extension
 
 Copy or symlink this directory into Pi's extensions directory, or add it to
-settings as a local package (see Pi's `packages.md`). The manifest already
-declares the entry point:
+settings as a local package (see Pi's `packages.md`). The manifest declares the
+extension entry point and the bundled agent skill:
 
 ```json
-{ "pi": { "extensions": ["./src/index.ts"] } }
+{ "pi": { "extensions": ["./src/index.ts"], "skills": ["./skills/loop-scheduler"] } }
 ```
+
+### Agent usage guide (bundled skill)
+
+The package ships [`skills/loop-scheduler/SKILL.md`](skills/loop-scheduler/SKILL.md),
+a first-party guide that teaches Pi how to **use** the scheduler correctly: the
+fixed/cron/one-shot/self-paced decision tree, all eight model-callable tools with
+their parameters, task identity and scope, and the lifecycle rules (iteration-
+scoped `schedule_wakeup`/`stop_wakeup`, one bounded fallback, coalescing, expiry,
+fixed/one-shot persistence vs ephemeral self-paced state, and cost/idempotency).
+
+Pi advertises the skill by name and description and loads it on demand, so the
+model may not read it on every turn. A user can force it with
+`/skill:loop-scheduler`; a scheduled prompt that needs self-paced continuation
+should state the required `schedule_wakeup`/`stop_wakeup` behavior explicitly.
+Loading the skill changes nothing at runtime — it is guidance only.
 
 ## Configure the self-paced fallback delay
 
@@ -478,6 +493,11 @@ like a fixed task, but a run whose time already passed while the session was
 closed is **dropped, never replayed**, on resume.
 
 ## Model-callable tools
+
+For agent-facing usage guidance, the package also ships the
+[`loop-scheduler` skill](skills/loop-scheduler/SKILL.md) (registered under
+`pi.skills`, invocable as `/skill:loop-scheduler`). It summarizes the decision
+tree, every tool schema, and the lifecycle rules below.
 
 Alongside the `/loop` command, the extension registers eight model-callable tools.
 They operate on the **same session-scoped task registry and scheduler** as
