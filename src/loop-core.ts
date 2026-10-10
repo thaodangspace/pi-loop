@@ -369,6 +369,19 @@ export class WakeupError extends Error {
 }
 
 /**
+ * Thrown when a task's expiry makes it impossible to reach its first run, or
+ * when an explicitly requested self-paced wakeup would land beyond the task's
+ * expiry. The expiry is inclusive: a first run or wakeup exactly at `expiresAt`
+ * is allowed; anything strictly after it is not.
+ */
+export class ExpiryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExpiryError";
+  }
+}
+
+/**
  * Clamp a requested self-paced delay into the supported 1 minute–1 hour range.
  * Non-finite values are rejected rather than silently clamped, so a malformed
  * model request surfaces instead of scheduling an arbitrary wakeup.
@@ -552,6 +565,11 @@ interface TrackedTask {
  *   only to the iteration that is currently executing. A task that becomes due
  *   while another iteration is active is queued and runs at the next idle
  *   boundary in the documented due order.
+ * - A self-paced task has no default expiry, but an explicit `expiresAt` is
+ *   enforced at every step. The expiry is inclusive (a run or wakeup exactly at
+ *   it is allowed); an expiry before the first run is rejected, a run strictly
+ *   after it is dropped, an explicit wakeup that would land after it is rejected
+ *   and terminates the task, and a fallback is never scheduled beyond it.
  *
  * Due-queue guarantees:
  * - While Pi is busy a due task is only marked in the scheduler's queue; its
@@ -725,6 +743,13 @@ export class LoopScheduler implements WakeupService {
     if (!Number.isFinite(at)) {
       throw new Error("one-shot time must be a finite epoch time");
     }
+    // A one-shot has no default expiry, but an explicit one that lands before
+    // its first (and only) run can never be reached. Reject it up front instead
+    // of returning a task that is discarded when its timer fires. The expiry is
+    // inclusive, so `expiresAt === at` still fires exactly at the boundary.
+    if (options.expiresAt !== undefined && options.expiresAt < at) {
+      throw new ExpiryError("one-shot task would expire before its first run");
+    }
     const created = this.registry.create({
       prompt: task,
       mode: "one-shot",
@@ -892,12 +917,21 @@ export class LoopScheduler implements WakeupService {
 
   /** Create and track one self-paced task with its own iteration state. */
   private createSelfPacedTask(prompt: string, options: SelfPacedStartOptions): ScheduledTask {
+    const now = this.deps.now();
     const fallbackDelayMs = clampWakeupDelay(options.fallbackDelayMs ?? DEFAULT_WAKEUP_FALLBACK_MS);
+    // A self-paced task has no default expiry, but an explicit one must not make
+    // it dead on arrival: its first run is due at `now`, and the expiry is
+    // inclusive, so a value exactly at `now` still lets that run happen while an
+    // earlier value can never reach it.
+    if (options.expiresAt !== undefined && options.expiresAt < now) {
+      throw new ExpiryError("self-paced task would expire before its first run");
+    }
     const created = this.registry.create({
       prompt,
       mode: "self-paced",
       ...(options.maintenance ? { maintenance: true } : {}),
-      nextFireAt: this.deps.now(),
+      nextFireAt: now,
+      ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
     });
     const entry = this.track(created);
     entry.fallbackDelayMs = fallbackDelayMs;
@@ -918,7 +952,8 @@ export class LoopScheduler implements WakeupService {
    * be terminated for a miss that a later iteration fixed. Throws
    * {@link WakeupError} when no self-paced iteration can be resolved — including
    * when the bound iteration has since been removed — or the scheduler is
-   * disposed.
+   * disposed, and {@link ExpiryError} when the wakeup would land after the
+   * task's expiry (the task is terminated).
    */
   scheduleNextWakeup(delayMs: number, reason?: string): WakeupDecision {
     if (this.disposed) {
@@ -929,25 +964,7 @@ export class LoopScheduler implements WakeupService {
     if (!entry || !task || task.mode !== "self-paced") {
       throw new WakeupError("no self-paced loop is running");
     }
-    const delay = clampWakeupDelay(delayMs);
-    const nextFireAtValue = this.deps.now() + delay;
-    const updated = this.registry.update(task.id, {
-      nextFireAt: nextFireAtValue,
-      pending: false,
-      reason: reason ?? null,
-    });
-    entry.awaitingDecision = false;
-    entry.fallbackUsed = false;
-    this.due.remove(entry.id);
-    this.clearTimer(entry);
-    this.armSelfPaced(entry, updated);
-    return {
-      requestedMs: delayMs,
-      delayMs: delay,
-      clamped: delay !== delayMs,
-      nextFireAt: nextFireAtValue,
-      ...(reason === undefined ? {} : { reason }),
-    };
+    return this.applyWakeup(entry, task, delayMs, reason);
   }
 
   /**
@@ -962,7 +979,8 @@ export class LoopScheduler implements WakeupService {
    * The requested delay is clamped into [1 minute, 1 hour]. An explicit choice
    * clears the fallback allowance and any queued missed run, exactly like an
    * iteration's own choice. Throws {@link WakeupError} for an unknown ID, a task
-   * that is not self-paced, or a disposed scheduler.
+   * that is not self-paced, or a disposed scheduler, and {@link ExpiryError}
+   * when the wakeup would land after the task's expiry (the task is terminated).
    */
   scheduleTaskWakeup(id: string, delayMs: number, reason?: string): WakeupDecision {
     if (this.disposed) {
@@ -973,9 +991,35 @@ export class LoopScheduler implements WakeupService {
     if (!entry || !task || task.mode !== "self-paced") {
       throw new WakeupError(`no self-paced task with id ${id}`);
     }
+    return this.applyWakeup(entry, task, delayMs, reason);
+  }
+
+  /**
+   * Apply an explicitly requested self-paced wakeup to one entry, enforcing the
+   * task's expiry.
+   *
+   * The delay is clamped into [1 minute, 1 hour]. A wakeup strictly after the
+   * task's expiry is impossible to honour, so the task is terminated (its timer,
+   * queued run, and registry record removed) and {@link ExpiryError} is thrown.
+   * The expiry is inclusive, so a wakeup exactly at it is scheduled normally.
+   */
+  private applyWakeup(
+    entry: TrackedTask,
+    task: ScheduledTask,
+    delayMs: number,
+    reason?: string,
+  ): WakeupDecision {
+    const current = this.registry.get(entry.id) ?? task;
     const delay = clampWakeupDelay(delayMs);
     const nextFireAtValue = this.deps.now() + delay;
-    const updated = this.registry.update(id, {
+    const expiresAt = current.expiresAt;
+    if (expiresAt !== undefined && nextFireAtValue > expiresAt) {
+      this.stopTask(entry.id);
+      throw new ExpiryError(
+        `self-paced wakeup at ${nextFireAtValue} would land after the task expiry at ${expiresAt}`,
+      );
+    }
+    const updated = this.registry.update(entry.id, {
       nextFireAt: nextFireAtValue,
       pending: false,
       reason: reason ?? null,
@@ -1156,6 +1200,11 @@ export class LoopScheduler implements WakeupService {
         continue;
       }
       if (task.mode === "self-paced") {
+        // A queued wakeup whose task expired during a long busy period is
+        // dropped (and removed) instead of delivered late.
+        if (this.expireIfPast(entry, task)) {
+          continue;
+        }
         this.beginSelfPacedRun(entry, task);
       } else {
         // A queued run whose task expired during a long busy period is dropped
@@ -1407,7 +1456,14 @@ export class LoopScheduler implements WakeupService {
     this.armTimer(entry, due);
   }
 
-  /** Arm a one-shot timer for the self-paced task's stored `nextFireAt`. */
+  /**
+   * Arm a one-shot timer for the self-paced task's stored `nextFireAt`.
+   *
+   * This is the single choke point for arming self-paced timers, so it also
+   * enforces expiry: a task whose stored wakeup is strictly after its expiry (or
+   * whose expiry has strictly passed) is removed instead of armed. The expiry is
+   * inclusive, so a wakeup exactly at it is still scheduled.
+   */
   private armSelfPaced(entry: TrackedTask, task: ScheduledTask): void {
     if (this.entries.get(entry.id) !== entry) {
       return;
@@ -1416,7 +1472,23 @@ export class LoopScheduler implements WakeupService {
     if (!current || current.mode !== "self-paced") {
       return;
     }
-    this.armAtTime(entry, current.nextFireAt ?? this.deps.now());
+    const due = current.nextFireAt ?? this.deps.now();
+    if (this.selfPacedExpired(current, due)) {
+      this.stopTask(entry.id);
+      return;
+    }
+    this.armAtTime(entry, due);
+  }
+
+  /**
+   * Whether a self-paced task can no longer run at `due`. The expiry is
+   * inclusive: a wakeup exactly at `expiresAt` is allowed, but anything strictly
+   * later is not, and a wakeup is impossible once `expiresAt` has strictly
+   * passed.
+   */
+  private selfPacedExpired(task: ScheduledTask, due: number): boolean {
+    const expiresAt = task.expiresAt;
+    return expiresAt !== undefined && (expiresAt < this.deps.now() || due > expiresAt);
   }
 
   /** Arm a timer to fire once at `due`, clamped so it never fires in the past. */
@@ -1514,6 +1586,11 @@ export class LoopScheduler implements WakeupService {
    * wakeup is chosen by the iteration that is about to run.
    */
   private onSelfPacedTick(entry: TrackedTask, task: ScheduledTask): void {
+    // A delayed tick (a sleep, a clock jump) may arrive after expiry. Remove the
+    // task instead of queuing or delivering an expired run.
+    if (this.expireIfPast(entry, task)) {
+      return;
+    }
     if (this.isIdle()) {
       this.beginSelfPacedRun(entry, task);
     } else {
@@ -1595,6 +1672,11 @@ export class LoopScheduler implements WakeupService {
    */
   private beginSelfPacedRun(entry: TrackedTask, task: ScheduledTask): boolean {
     this.due.remove(entry.id);
+    // A run queued while Pi was busy may have outlived the task's expiry. Drop
+    // it (and the task) rather than delivering it late.
+    if (this.expireIfPast(entry, task)) {
+      return false;
+    }
     if (this.activeSelfPacedId !== undefined && this.activeSelfPacedId !== entry.id) {
       // Another iteration (or a turn whose bound task was removed) owns the
       // active agent turn. Coalesce this due wakeup into the queue rather than
@@ -1644,6 +1726,14 @@ export class LoopScheduler implements WakeupService {
     entry.fallbackUsed = true;
     const delay = clampWakeupDelay(entry.fallbackDelayMs);
     const fallbackAt = this.deps.now() + delay;
+    // A fallback may never schedule beyond the task's expiry. When it would,
+    // terminate instead of arming (which `armSelfPaced` would also reject), so
+    // the settle result is reported honestly as a termination.
+    const expiresAt = this.registry.get(entry.id)?.expiresAt ?? task.expiresAt;
+    if (expiresAt !== undefined && fallbackAt > expiresAt) {
+      this.stopTask(entry.id);
+      return { action: "terminated" };
+    }
     const updated = this.registry.update(entry.id, { nextFireAt: fallbackAt, pending: false, reason: null });
     this.due.remove(entry.id);
     this.clearTimer(entry);

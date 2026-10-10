@@ -95,8 +95,9 @@ export interface LoopTaskSummary {
 export interface LoopScheduleOptions {
   /**
    * Optional absolute expiry. Recurring fixed tasks default to seven days from
-   * creation; one-shot tasks have no default. A value that lands before the
-   * first run is rejected.
+   * creation; one-shot and self-paced tasks have no default. A value that lands
+   * before the first run is rejected, and a self-paced wakeup that would land
+   * after it is rejected and terminates the task.
    */
   readonly expiresAt?: number;
 }
